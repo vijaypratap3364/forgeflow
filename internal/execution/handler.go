@@ -22,8 +22,10 @@ const (
 
 // TaskRequest contains the immutable inputs supplied to a task handler.
 type TaskRequest struct {
-	RunID RunID
-	Task  workflow.TaskDefinition
+	RunID     RunID
+	TaskRunID TaskRunID
+	AttemptID AttemptID
+	Task      workflow.TaskDefinition
 }
 
 // TaskHandler executes one safe, registered task operation. Implementations may

@@ -323,6 +323,19 @@ func TestEngineRejectsInvalidConfigurationAndUnknownHandler(t *testing.T) {
 	if !errors.As(err, &configError) {
 		t.Fatalf("NewEngine(nil store) error = %v, want *InvalidEngineConfigError", err)
 	}
+	invalidOptions := []EngineOption{
+		nil,
+		WithClock(nil),
+		WithLeaseTiming(0, time.Second),
+		WithLeaseTiming(time.Second, time.Second),
+		WithWorkerNamespace("bad namespace"),
+	}
+	for index, option := range invalidOptions {
+		_, err := NewEngine(1, NewHandlerRegistry(), newMemoryTestStore(), option)
+		if !errors.As(err, &configError) {
+			t.Fatalf("NewEngine(invalid option %d) error = %v, want *InvalidEngineConfigError", index, err)
+		}
+	}
 
 	engine := mustEngine(t, 1, NewHandlerRegistry())
 	run, err := engine.Execute(
@@ -417,6 +430,7 @@ func TestEngineRecoverReexecutesInterruptedRunningTask(t *testing.T) {
 		t.Fatalf("Register() error = %v", err)
 	}
 	definition := executionWorkflow(executionTask("a", "recover", ""))
+	definition.Tasks[0].Retry.MaxAttempts = 2
 	if err := store.SaveWorkflow(context.Background(), definition); err != nil {
 		t.Fatalf("SaveWorkflow() error = %v", err)
 	}
@@ -590,7 +604,11 @@ func (store *memoryTestStore) LoadRun(
 
 func cloneTestSnapshot(snapshot WorkflowRunSnapshot) WorkflowRunSnapshot {
 	clone := snapshot
-	clone.Tasks = append([]TaskRun(nil), snapshot.Tasks...)
+	clone.Tasks = make([]TaskRun, len(snapshot.Tasks))
+	for index, task := range snapshot.Tasks {
+		clone.Tasks[index] = cloneTaskRun(task)
+	}
+	clone.Workers = append([]WorkerHeartbeat(nil), snapshot.Workers...)
 	return clone
 }
 

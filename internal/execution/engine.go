@@ -6,21 +6,28 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/vijaypratap3364/forgeflow/internal/workflow"
 )
 
-// Engine executes workflows with a configurable in-process worker pool and a
-// durable Store. Execute is safe to call concurrently; each call owns its queue
-// and workers while the Store serializes durable state changes.
+// Engine executes workflows with identified in-process workers and durable
+// reliability state. Execute is safe to call concurrently; each run owns its
+// worker pool while the Store serializes durable aggregate changes.
 type Engine struct {
 	workerCount int
 	registry    *HandlerRegistry
 	store       Store
+	config      engineConfig
 }
 
 // NewEngine creates an in-process workflow execution engine.
-func NewEngine(workerCount int, registry *HandlerRegistry, store Store) (*Engine, error) {
+func NewEngine(
+	workerCount int,
+	registry *HandlerRegistry,
+	store Store,
+	options ...EngineOption,
+) (*Engine, error) {
 	if workerCount < 1 {
 		return nil, &InvalidEngineConfigError{
 			WorkerCount: workerCount,
@@ -40,10 +47,27 @@ func NewEngine(workerCount int, registry *HandlerRegistry, store Store) (*Engine
 		}
 	}
 
+	config, err := defaultEngineConfig()
+	if err != nil {
+		return nil, &InvalidEngineConfigError{WorkerCount: workerCount, Reason: err.Error()}
+	}
+	for _, option := range options {
+		if option == nil {
+			return nil, &InvalidEngineConfigError{WorkerCount: workerCount, Reason: "engine option must not be nil"}
+		}
+		if err := option(&config); err != nil {
+			return nil, &InvalidEngineConfigError{WorkerCount: workerCount, Reason: err.Error()}
+		}
+	}
+	if err := config.validate(); err != nil {
+		return nil, &InvalidEngineConfigError{WorkerCount: workerCount, Reason: err.Error()}
+	}
+
 	return &Engine{
 		workerCount: workerCount,
 		registry:    registry,
 		store:       store,
+		config:      config,
 	}, nil
 }
 
@@ -52,9 +76,7 @@ func (engine *Engine) WorkerCount() int {
 	return engine.workerCount
 }
 
-// Execute validates, durably creates, and runs a new workflow execution. A
-// handler failure fails the workflow and cancels all remaining work. Context
-// cancellation marks the workflow and every unfinished task canceled.
+// Execute validates, durably creates, and runs a new workflow execution.
 func (engine *Engine) Execute(
 	ctx context.Context,
 	runID RunID,
@@ -64,7 +86,7 @@ func (engine *Engine) Execute(
 		return nil, errors.New("execute workflow: context is nil")
 	}
 
-	run, err := NewWorkflowRun(runID, definition)
+	run, err := newWorkflowRun(runID, definition, engine.config.clock.Now)
 	if err != nil {
 		return nil, err
 	}
@@ -91,13 +113,12 @@ func (engine *Engine) Execute(
 	if err := engine.saveRun(durabilityContext, run, "start workflow run"); err != nil {
 		return run, err
 	}
-
 	return engine.executeActiveRun(ctx, durabilityContext, run, resolvedHandlers)
 }
 
 // Recover reconstructs a persisted workflow run. Terminal runs are returned
-// unchanged. A nonterminal run resumes from completed tasks; a task that was
-// running at process loss is made ready and may execute again.
+// unchanged. A valid lease is allowed to expire rather than being stolen; an
+// expired or legacy lease is recovered according to the task retry policy.
 func (engine *Engine) Recover(ctx context.Context, runID RunID) (*WorkflowRun, error) {
 	if ctx == nil {
 		return nil, errors.New("recover workflow: context is nil")
@@ -120,7 +141,7 @@ func (engine *Engine) Recover(ctx context.Context, runID RunID) (*WorkflowRun, e
 	if !found {
 		return nil, &WorkflowNotFoundError{WorkflowID: snapshot.WorkflowID}
 	}
-	run, err := RestoreWorkflowRun(snapshot, definition)
+	run, err := restoreWorkflowRun(snapshot, definition, engine.config.clock.Now)
 	if err != nil {
 		return nil, fmt.Errorf("restore workflow run %q: %w", runID, err)
 	}
@@ -141,11 +162,6 @@ func (engine *Engine) Recover(ctx context.Context, runID RunID) (*WorkflowRun, e
 		}
 		return run, nil
 	}
-	if run.recoverInterruptedTasks() {
-		if err := engine.saveRun(durabilityContext, run, "release interrupted tasks"); err != nil {
-			return run, err
-		}
-	}
 	if run.Status() == WorkflowRunPending {
 		if err := run.transitionWorkflow(WorkflowRunRunning); err != nil {
 			return run, fmt.Errorf("start recovered workflow run: %w", err)
@@ -161,7 +177,6 @@ func (engine *Engine) Recover(ctx context.Context, runID RunID) (*WorkflowRun, e
 	if err != nil {
 		return run, err
 	}
-
 	return engine.executeActiveRun(ctx, durabilityContext, run, resolvedHandlers)
 }
 
@@ -181,6 +196,28 @@ func recoveredTerminalTaskState(run *WorkflowRun) (WorkflowRunStatus, error) {
 	return "", nil
 }
 
+type localWorker struct {
+	id     WorkerID
+	slot   int
+	jobs   chan taskJob
+	cancel context.CancelFunc
+}
+
+type workerAvailable struct {
+	workerID WorkerID
+	slot     int
+	jobs     chan taskJob
+}
+
+type workerHeartbeatEvent struct {
+	workerID WorkerID
+}
+
+type workerLostEvent struct {
+	workerID WorkerID
+	slot     int
+}
+
 func (engine *Engine) executeActiveRun(
 	ctx context.Context,
 	durabilityContext context.Context,
@@ -188,202 +225,343 @@ func (engine *Engine) executeActiveRun(
 	resolvedHandlers map[workflow.TaskID]TaskHandler,
 ) (*WorkflowRun, error) {
 	definition := run.definition
+	definitions := taskDefinitionsByID(definition)
 	completed := completedTaskIDs(run)
-	ready := existingReadyTasks(run, definition)
+	ready := make(map[workflow.TaskID]workflow.TaskDefinition)
+	for _, task := range existingReadyTasks(run, definition) {
+		ready[task.ID] = task
+	}
 	newReady, err := markNewReady(run, definition, completed)
 	if err != nil {
 		return engine.failRun(durabilityContext, run, fmt.Errorf("prepare workflow run: %w", err))
 	}
-	ready = append(ready, newReady...)
-	sortTasks(ready)
+	for _, task := range newReady {
+		ready[task.ID] = task
+	}
 	if len(newReady) > 0 {
 		if err := engine.saveRun(durabilityContext, run, "make dependency-ready tasks schedulable"); err != nil {
 			return engine.failRun(durabilityContext, run, err)
 		}
 	}
 
-	runContext, cancelRun := context.WithCancel(ctx)
-	jobs := make(chan taskJob)
-	results := make(chan taskResult)
+	runContext, cancelRunWorkers := context.WithCancel(ctx)
+	availableEvents := make(chan workerAvailable, engine.workerCount*2)
+	heartbeatEvents := make(chan workerHeartbeatEvent, engine.workerCount*2)
+	resultEvents := make(chan taskResult, engine.workerCount*2)
+	lostEvents := make(chan workerLostEvent, engine.workerCount*2)
 
-	var workers sync.WaitGroup
-	workers.Add(engine.workerCount)
-	for range engine.workerCount {
-		go executeTasks(runContext, jobs, results, &workers)
+	var workerGroup sync.WaitGroup
+	workers := make(map[WorkerID]*localWorker)
+	currentBySlot := make(map[int]WorkerID)
+	generations := make(map[int]int)
+	available := make(map[WorkerID]workerAvailable)
+
+	spawnWorker := func(slot int) {
+		generations[slot]++
+		workerID := WorkerID(fmt.Sprintf(
+			"%s/%s/slot-%d/generation-%d",
+			engine.config.workerNamespace,
+			run.id,
+			slot,
+			generations[slot],
+		))
+		workerContext, cancelWorker := context.WithCancel(runContext)
+		worker := &localWorker{
+			id:     workerID,
+			slot:   slot,
+			jobs:   make(chan taskJob, 1),
+			cancel: cancelWorker,
+		}
+		workers[workerID] = worker
+		currentBySlot[slot] = workerID
+		workerGroup.Add(1)
+		go executeWorker(
+			workerContext,
+			engine.config.clock,
+			engine.config.heartbeatInterval,
+			workerAvailable{workerID: workerID, slot: slot, jobs: worker.jobs},
+			availableEvents,
+			heartbeatEvents,
+			resultEvents,
+			lostEvents,
+			&workerGroup,
+		)
 	}
 
+	for slot := 1; slot <= engine.workerCount; slot++ {
+		spawnWorker(slot)
+	}
 	shutdownWorkers := func() {
-		close(jobs)
-		cancelRun()
-		workers.Wait()
+		cancelRunWorkers()
+		for _, worker := range workers {
+			worker.cancel()
+		}
+		workerGroup.Wait()
 	}
 
-	var (
-		inFlight          int
-		preparedJob       *taskJob
-		taskFailure       *TaskExecutionError
-		cancellationCause error
-		schedulerFailure  error
-	)
+	inFlight := make(map[AttemptID]struct{})
+	for _, task := range run.Tasks() {
+		if task.Status == TaskRunRunning && task.CurrentAttemptID != "" {
+			inFlight[task.CurrentAttemptID] = struct{}{}
+		}
+	}
+
+	replaceWorker := func(workerID WorkerID) {
+		worker, exists := workers[workerID]
+		if !exists || currentBySlot[worker.slot] != workerID {
+			return
+		}
+		worker.cancel()
+		delete(available, workerID)
+		delete(workers, workerID)
+		delete(currentBySlot, worker.slot)
+		spawnWorker(worker.slot)
+	}
 
 	for {
-		stopping := taskFailure != nil || cancellationCause != nil || schedulerFailure != nil
-		if stopping {
-			preparedJob = nil
-		}
-		if !stopping && len(completed) == len(definition.Tasks) {
-			if err := run.transitionWorkflow(WorkflowRunSucceeded); err != nil {
-				schedulerFailure = fmt.Errorf("complete workflow run: %w", err)
-				cancelRun()
+		recoveries := run.recoverExpiredLeases()
+		promoted := run.promoteDueRetries()
+		var leaseFailure *TaskExecutionError
+		for _, recovery := range recoveries {
+			delete(inFlight, recovery.AttemptID)
+			if recovery.WorkerID != "" {
+				replaceWorker(recovery.WorkerID)
+			}
+			if recovery.Outcome == CompletionRetryScheduled {
+				task := requireDefinition(definitions, recovery.TaskID)
+				if current, exists := run.Task(recovery.TaskID); exists && current.Status == TaskRunReady {
+					ready[task.ID] = task
+				}
 				continue
+			}
+			leaseFailure = &TaskExecutionError{
+				RunID:  run.id,
+				TaskID: recovery.TaskID,
+				Cause: &LeaseExpiredError{
+					RunID:     run.id,
+					TaskID:    recovery.TaskID,
+					AttemptID: recovery.AttemptID,
+				},
+			}
+		}
+		for _, taskID := range promoted {
+			ready[taskID] = requireDefinition(definitions, taskID)
+		}
+		if len(recoveries) > 0 || len(promoted) > 0 {
+			if err := engine.saveRun(durabilityContext, run, "recover expired leases and due retries"); err != nil {
+				shutdownWorkers()
+				return engine.failRun(durabilityContext, run, err)
+			}
+		}
+		if leaseFailure != nil {
+			shutdownWorkers()
+			return engine.failRun(durabilityContext, run, leaseFailure)
+		}
+
+		if len(completed) == len(definition.Tasks) {
+			shutdownWorkers()
+			if err := run.transitionWorkflow(WorkflowRunSucceeded); err != nil {
+				return engine.failRun(durabilityContext, run, fmt.Errorf("complete workflow run: %w", err))
 			}
 			if err := engine.saveRun(durabilityContext, run, "complete workflow run"); err != nil {
-				shutdownWorkers()
 				return run, err
 			}
-			shutdownWorkers()
 			return run, nil
 		}
-		if stopping && inFlight == 0 {
-			break
-		}
 
-		if !stopping && preparedJob == nil && len(ready) > 0 {
-			nextTask := ready[0]
-			ready = ready[1:]
-			if err := run.transitionTask(nextTask.ID, TaskRunRunning, "", nil); err != nil {
-				schedulerFailure = fmt.Errorf("mark task running: %w", err)
-				cancelRun()
-				continue
-			}
-			if err := engine.saveRun(durabilityContext, run, "dispatch task"); err != nil {
-				schedulerFailure = err
-				cancelRun()
-				continue
-			}
-			preparedJob = &taskJob{
-				request: TaskRequest{
-					RunID: run.id,
-					Task:  cloneTaskDefinition(nextTask),
-				},
-				handler: resolvedHandlers[nextTask.ID],
-			}
-		}
-		if !stopping && preparedJob == nil && len(ready) == 0 && inFlight == 0 {
-			schedulerFailure = fmt.Errorf("workflow run %q stalled with unfinished tasks", run.id)
-			cancelRun()
-			continue
-		}
-
-		var (
-			dispatch   chan<- taskJob
-			nextJob    taskJob
-			parentDone <-chan struct{}
-		)
-		if !stopping && preparedJob != nil {
-			dispatch = jobs
-			nextJob = *preparedJob
-		}
-		if !stopping {
-			parentDone = ctx.Done()
-		}
-
-		select {
-		case dispatch <- nextJob:
-			preparedJob = nil
-			inFlight++
-
-		case result := <-results:
-			inFlight--
-			stopping = taskFailure != nil || cancellationCause != nil || schedulerFailure != nil
-			if !stopping {
-				if contextErr := ctx.Err(); contextErr != nil {
-					cancellationCause = contextErr
-					cancelRun()
-					stopping = true
-				}
-			}
-			if stopping {
-				cause := cancellationCause
-				if cause == nil {
-					cause = combinedRunFailure(schedulerFailure, taskFailure)
-				}
-				if result.err == nil {
-					err = run.transitionTask(result.taskID, TaskRunSucceeded, result.output, nil)
-				} else {
-					err = run.transitionTask(result.taskID, TaskRunCanceled, "", cause)
-				}
-				if err != nil && schedulerFailure == nil {
-					schedulerFailure = fmt.Errorf("record task result while stopping: %w", err)
-				}
-				if err == nil {
-					if saveErr := engine.saveRun(durabilityContext, run, "record task result while stopping"); saveErr != nil && schedulerFailure == nil {
-						schedulerFailure = saveErr
-					}
-				}
-				continue
-			}
-
-			if result.err != nil {
-				if err := run.transitionTask(result.taskID, TaskRunFailed, "", result.err); err != nil {
-					schedulerFailure = fmt.Errorf("record task failure: %w", err)
-				} else {
-					taskFailure = &TaskExecutionError{
-						RunID:  run.id,
-						TaskID: result.taskID,
-						Cause:  result.err,
-					}
-					if saveErr := engine.saveRun(durabilityContext, run, "record task failure"); saveErr != nil {
-						schedulerFailure = saveErr
-					}
-				}
-				cancelRun()
-				continue
-			}
-
-			if err := run.transitionTask(result.taskID, TaskRunSucceeded, result.output, nil); err != nil {
-				schedulerFailure = fmt.Errorf("record task success: %w", err)
-				cancelRun()
-				continue
-			}
-			completed[result.taskID] = struct{}{}
-			newReady, err := markNewReady(run, definition, completed)
+		if len(ready) > 0 && len(available) > 0 {
+			task := popReadyTask(ready)
+			workerSlot := popAvailableWorker(available)
+			attemptID, err := run.startTaskAttempt(task.ID, workerSlot.workerID, engine.config.leaseDuration)
 			if err != nil {
-				schedulerFailure = fmt.Errorf("unlock dependent tasks: %w", err)
-				cancelRun()
-				continue
+				shutdownWorkers()
+				return engine.failRun(durabilityContext, run, fmt.Errorf("lease task to worker: %w", err))
 			}
-			ready = append(ready, newReady...)
-			sortTasks(ready)
-			if err := engine.saveRun(durabilityContext, run, "record task success and unlock dependencies"); err != nil {
-				schedulerFailure = err
-				cancelRun()
+			if err := engine.saveRun(durabilityContext, run, "lease and dispatch task"); err != nil {
+				shutdownWorkers()
+				return engine.failRun(durabilityContext, run, err)
+			}
+			inFlight[attemptID] = struct{}{}
+			job := taskJob{
+				request: TaskRequest{
+					RunID:     run.id,
+					TaskRunID: TaskRunIDFor(run.id, task.ID),
+					AttemptID: attemptID,
+					Task:      cloneTaskDefinition(task),
+				},
+				handler: resolvedHandlers[task.ID],
+			}
+			select {
+			case workerSlot.jobs <- job:
+				continue
+			case <-ctx.Done():
+				shutdownWorkers()
+				return engine.cancelRun(durabilityContext, run, ctx.Err())
+			}
+		}
+
+		if len(ready) == 0 && len(inFlight) == 0 {
+			if _, waiting := run.nextReliabilityDeadline(); !waiting {
+				shutdownWorkers()
+				return engine.failRun(
+					durabilityContext,
+					run,
+					fmt.Errorf("workflow run %q stalled with unfinished tasks", run.id),
+				)
+			}
+		}
+
+		timer, timerChannel := engine.reliabilityTimer(run)
+		select {
+		case event := <-availableEvents:
+			if currentBySlot[event.slot] != event.workerID {
+				break
+			}
+			if err := run.recordWorkerHeartbeat(event.workerID, engine.config.leaseDuration); err != nil {
+				if timer != nil {
+					timer.Stop()
+				}
+				shutdownWorkers()
+				return engine.failRun(durabilityContext, run, fmt.Errorf("register worker: %w", err))
+			}
+			if err := engine.saveRun(durabilityContext, run, "register available worker"); err != nil {
+				if timer != nil {
+					timer.Stop()
+				}
+				shutdownWorkers()
+				return engine.failRun(durabilityContext, run, err)
+			}
+			available[event.workerID] = event
+
+		case event := <-heartbeatEvents:
+			worker, alive := workers[event.workerID]
+			if !alive || currentBySlot[worker.slot] != event.workerID {
+				break
+			}
+			if err := run.recordWorkerHeartbeat(event.workerID, engine.config.leaseDuration); err != nil {
+				if timer != nil {
+					timer.Stop()
+				}
+				shutdownWorkers()
+				return engine.failRun(durabilityContext, run, fmt.Errorf("record worker heartbeat: %w", err))
+			}
+			if err := engine.saveRun(durabilityContext, run, "record worker heartbeat"); err != nil {
+				if timer != nil {
+					timer.Stop()
+				}
+				shutdownWorkers()
+				return engine.failRun(durabilityContext, run, err)
 			}
 
-		case <-parentDone:
-			cancellationCause = ctx.Err()
-			cancelRun()
+		case event := <-lostEvents:
+			if currentBySlot[event.slot] == event.workerID {
+				replaceWorker(event.workerID)
+			}
+
+		case result := <-resultEvents:
+			if contextErr := ctx.Err(); contextErr != nil {
+				if timer != nil {
+					timer.Stop()
+				}
+				shutdownWorkers()
+				return engine.cancelRun(durabilityContext, run, contextErr)
+			}
+			delete(inFlight, result.attemptID)
+			outcome, err := run.completeTaskAttempt(
+				result.taskID,
+				result.taskRunID,
+				result.workerID,
+				result.attemptID,
+				result.output,
+				result.err,
+			)
+			if err != nil {
+				if timer != nil {
+					timer.Stop()
+				}
+				shutdownWorkers()
+				return engine.failRun(durabilityContext, run, fmt.Errorf("record identified task completion: %w", err))
+			}
+			switch outcome {
+			case CompletionIgnored:
+				// Duplicate and stale completion events are deliberately no-ops.
+			case CompletionSucceeded:
+				completed[result.taskID] = struct{}{}
+				newReady, err := markNewReady(run, definition, completed)
+				if err != nil {
+					if timer != nil {
+						timer.Stop()
+					}
+					shutdownWorkers()
+					return engine.failRun(durabilityContext, run, fmt.Errorf("unlock dependent tasks: %w", err))
+				}
+				for _, task := range newReady {
+					ready[task.ID] = task
+				}
+				if err := engine.saveRun(durabilityContext, run, "record completion and unlock dependencies"); err != nil {
+					if timer != nil {
+						timer.Stop()
+					}
+					shutdownWorkers()
+					return engine.failRun(durabilityContext, run, err)
+				}
+			case CompletionRetryScheduled:
+				if task, exists := run.Task(result.taskID); exists && task.Status == TaskRunReady {
+					ready[result.taskID] = requireDefinition(definitions, result.taskID)
+				}
+				if err := engine.saveRun(durabilityContext, run, "schedule task retry"); err != nil {
+					if timer != nil {
+						timer.Stop()
+					}
+					shutdownWorkers()
+					return engine.failRun(durabilityContext, run, err)
+				}
+			case CompletionFailed:
+				if err := engine.saveRun(durabilityContext, run, "record terminal task failure"); err != nil {
+					if timer != nil {
+						timer.Stop()
+					}
+					shutdownWorkers()
+					return engine.failRun(durabilityContext, run, err)
+				}
+				if timer != nil {
+					timer.Stop()
+				}
+				shutdownWorkers()
+				return engine.failRun(durabilityContext, run, &TaskExecutionError{
+					RunID:  run.id,
+					TaskID: result.taskID,
+					Cause:  result.err,
+				})
+			}
+
+		case <-timerChannel:
+			// The loop applies due retries and expired leases against Clock.Now.
+
+		case <-ctx.Done():
+			if timer != nil {
+				timer.Stop()
+			}
+			shutdownWorkers()
+			return engine.cancelRun(durabilityContext, run, ctx.Err())
+		}
+		if timer != nil {
+			timer.Stop()
 		}
 	}
-
-	shutdownWorkers()
-	if schedulerFailure != nil {
-		return engine.failRun(durabilityContext, run, combinedRunFailure(schedulerFailure, taskFailure))
-	}
-	if taskFailure != nil {
-		return engine.failRun(durabilityContext, run, taskFailure)
-	}
-	return engine.cancelRun(durabilityContext, run, cancellationCause)
 }
 
-func combinedRunFailure(schedulerFailure error, taskFailure *TaskExecutionError) error {
-	if schedulerFailure == nil {
-		return taskFailure
+func (engine *Engine) reliabilityTimer(run *WorkflowRun) (Timer, <-chan time.Time) {
+	deadline, exists := run.nextReliabilityDeadline()
+	if !exists {
+		return nil, nil
 	}
-	if taskFailure == nil {
-		return schedulerFailure
+	duration := deadline.Sub(engine.config.clock.Now().UTC())
+	if duration < 0 {
+		duration = 0
 	}
-	return errors.Join(schedulerFailure, taskFailure)
+	timer := engine.config.clock.NewTimer(duration)
+	return timer, timer.C()
 }
 
 func (engine *Engine) failRun(
@@ -433,7 +611,6 @@ func (engine *Engine) resolveHandlers(
 ) (map[workflow.TaskID]TaskHandler, error) {
 	tasks := append([]workflow.TaskDefinition(nil), definition.Tasks...)
 	sortTasks(tasks)
-
 	resolved := make(map[workflow.TaskID]TaskHandler, len(tasks))
 	for _, task := range tasks {
 		handler, exists := engine.registry.Handler(task.Handler)
@@ -457,7 +634,6 @@ func markNewReady(
 	if err != nil {
 		return nil, err
 	}
-
 	ready := make([]workflow.TaskDefinition, 0, len(candidates))
 	for _, task := range candidates {
 		status, err := run.taskStatus(task.ID)
@@ -489,10 +665,7 @@ func existingReadyTasks(
 	run *WorkflowRun,
 	definition workflow.WorkflowDefinition,
 ) []workflow.TaskDefinition {
-	definitions := make(map[workflow.TaskID]workflow.TaskDefinition, len(definition.Tasks))
-	for _, task := range definition.Tasks {
-		definitions[task.ID] = task
-	}
+	definitions := taskDefinitionsByID(definition)
 	ready := make([]workflow.TaskDefinition, 0)
 	for _, task := range run.Tasks() {
 		if task.Status == TaskRunReady {
@@ -501,6 +674,43 @@ func existingReadyTasks(
 	}
 	sortTasks(ready)
 	return ready
+}
+
+func taskDefinitionsByID(definition workflow.WorkflowDefinition) map[workflow.TaskID]workflow.TaskDefinition {
+	tasks := make(map[workflow.TaskID]workflow.TaskDefinition, len(definition.Tasks))
+	for _, task := range definition.Tasks {
+		tasks[task.ID] = task
+	}
+	return tasks
+}
+
+func requireDefinition(
+	definitions map[workflow.TaskID]workflow.TaskDefinition,
+	taskID workflow.TaskID,
+) workflow.TaskDefinition {
+	return definitions[taskID]
+}
+
+func popReadyTask(ready map[workflow.TaskID]workflow.TaskDefinition) workflow.TaskDefinition {
+	taskIDs := make([]workflow.TaskID, 0, len(ready))
+	for taskID := range ready {
+		taskIDs = append(taskIDs, taskID)
+	}
+	sort.Slice(taskIDs, func(left, right int) bool { return taskIDs[left] < taskIDs[right] })
+	task := ready[taskIDs[0]]
+	delete(ready, task.ID)
+	return task
+}
+
+func popAvailableWorker(available map[WorkerID]workerAvailable) workerAvailable {
+	workerIDs := make([]WorkerID, 0, len(available))
+	for workerID := range available {
+		workerIDs = append(workerIDs, workerID)
+	}
+	sort.Slice(workerIDs, func(left, right int) bool { return workerIDs[left] < workerIDs[right] })
+	worker := available[workerIDs[0]]
+	delete(available, worker.workerID)
+	return worker
 }
 
 func sortTasks(tasks []workflow.TaskDefinition) {
@@ -515,36 +725,111 @@ type taskJob struct {
 }
 
 type taskResult struct {
-	taskID workflow.TaskID
-	output string
-	err    error
+	taskID    workflow.TaskID
+	taskRunID TaskRunID
+	workerID  WorkerID
+	attemptID AttemptID
+	output    string
+	err       error
 }
 
-func executeTasks(
+var errWorkerDisappeared = errors.New("worker disappeared")
+
+func executeWorker(
 	ctx context.Context,
-	jobs <-chan taskJob,
+	clock Clock,
+	heartbeatInterval time.Duration,
+	identity workerAvailable,
+	available chan<- workerAvailable,
+	heartbeats chan<- workerHeartbeatEvent,
 	results chan<- taskResult,
+	lost chan<- workerLostEvent,
 	workers *sync.WaitGroup,
 ) {
 	defer workers.Done()
+
+	heartbeatContext, cancelHeartbeat := context.WithCancel(ctx)
+	var heartbeatGroup sync.WaitGroup
+	heartbeatGroup.Add(1)
+	go emitHeartbeats(heartbeatContext, clock, heartbeatInterval, identity.workerID, heartbeats, &heartbeatGroup)
+	defer func() {
+		cancelHeartbeat()
+		heartbeatGroup.Wait()
+	}()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case job, open := <-jobs:
-			if !open {
-				return
-			}
+		case available <- identity:
+		}
 
-			output, err := job.handler.Execute(ctx, job.request)
-			results <- taskResult{
-				taskID: job.request.Task.ID,
-				output: output,
-				err:    err,
+		var job taskJob
+		select {
+		case <-ctx.Done():
+			return
+		case job = <-identity.jobs:
+		}
+
+		output, err := invokeHandler(ctx, job)
+		if errors.Is(err, errWorkerDisappeared) {
+			cancelHeartbeat()
+			heartbeatGroup.Wait()
+			select {
+			case <-ctx.Done():
+			case lost <- workerLostEvent{workerID: identity.workerID, slot: identity.slot}:
 			}
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case results <- taskResult{
+			taskID:    job.request.Task.ID,
+			taskRunID: job.request.TaskRunID,
+			workerID:  identity.workerID,
+			attemptID: job.request.AttemptID,
+			output:    output,
+			err:       err,
+		}:
 		}
 	}
+}
+
+func emitHeartbeats(
+	ctx context.Context,
+	clock Clock,
+	interval time.Duration,
+	workerID WorkerID,
+	events chan<- workerHeartbeatEvent,
+	workers *sync.WaitGroup,
+) {
+	defer workers.Done()
+	for {
+		timer := clock.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C():
+			timer.Stop()
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case events <- workerHeartbeatEvent{workerID: workerID}:
+		}
+	}
+}
+
+func invokeHandler(ctx context.Context, job taskJob) (output string, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			output = ""
+			err = fmt.Errorf("%w: handler panic: %v", errWorkerDisappeared, recovered)
+		}
+	}()
+	return job.handler.Execute(ctx, job.request)
 }
 
 func cloneTaskDefinition(task workflow.TaskDefinition) workflow.TaskDefinition {

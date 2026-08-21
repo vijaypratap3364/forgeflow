@@ -317,35 +317,6 @@ func (run *WorkflowRun) cancelUnfinished(cause error) {
 	}
 }
 
-// recoverInterruptedTasks makes work that was running when the previous process
-// stopped eligible for dispatch again. AttemptCount is preserved so a repeated
-// execution is visible even though Stage 3 does not yet model attempt history.
-func (run *WorkflowRun) recoverInterruptedTasks() bool {
-	run.mu.Lock()
-	defer run.mu.Unlock()
-
-	timestamp := run.nextTimestampLocked()
-	changed := false
-	for taskID, task := range run.tasks {
-		if task.Status != TaskRunRunning {
-			continue
-		}
-		task.Status = TaskRunReady
-		task.Output = ""
-		task.Error = ""
-		task.UpdatedAt = timestamp
-		task.FinishedAt = time.Time{}
-		task.Lease = nil
-		task.NextAttemptAt = time.Time{}
-		run.tasks[taskID] = task
-		changed = true
-	}
-	if changed {
-		run.updatedAt = timestamp
-	}
-	return changed
-}
-
 func (run *WorkflowRun) nextTimestampLocked() time.Time {
 	timestamp := run.now().UTC()
 	if timestamp.Before(run.updatedAt) {

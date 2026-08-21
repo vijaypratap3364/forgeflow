@@ -49,6 +49,7 @@ const (
 type LeaseRecovery struct {
 	TaskID    workflow.TaskID
 	AttemptID AttemptID
+	WorkerID  WorkerID
 	Outcome   CompletionOutcome
 }
 
@@ -161,6 +162,7 @@ func (run *WorkflowRun) startTaskAttempt(
 
 func (run *WorkflowRun) completeTaskAttempt(
 	taskID workflow.TaskID,
+	taskRunID TaskRunID,
 	workerID WorkerID,
 	attemptID AttemptID,
 	output string,
@@ -172,7 +174,7 @@ func (run *WorkflowRun) completeTaskAttempt(
 	if !exists {
 		return "", &UnknownTaskRunError{RunID: run.id, TaskID: taskID}
 	}
-	if task.Status != TaskRunRunning || task.CurrentAttemptID != attemptID || task.Lease == nil ||
+	if task.Status != TaskRunRunning || task.TaskRunID != taskRunID || task.CurrentAttemptID != attemptID || task.Lease == nil ||
 		task.Lease.AttemptID != attemptID || task.Lease.WorkerID != workerID {
 		return CompletionIgnored, nil
 	}
@@ -228,6 +230,10 @@ func (run *WorkflowRun) recoverExpiredLeases() []LeaseRecovery {
 		}
 
 		attemptID := task.CurrentAttemptID
+		workerID := WorkerID("")
+		if task.Lease != nil {
+			workerID = task.Lease.WorkerID
+		}
 		if attemptID == "" && task.AttemptCount > 0 {
 			task.TaskRunID = TaskRunIDFor(run.id, taskID)
 			attemptID = AttemptIDFor(task.TaskRunID, task.AttemptCount)
@@ -255,7 +261,7 @@ func (run *WorkflowRun) recoverExpiredLeases() []LeaseRecovery {
 			task.Status = TaskRunFailed
 		}
 		run.tasks[taskID] = task
-		recoveries = append(recoveries, LeaseRecovery{TaskID: taskID, AttemptID: attemptID, Outcome: outcome})
+		recoveries = append(recoveries, LeaseRecovery{TaskID: taskID, AttemptID: attemptID, WorkerID: workerID, Outcome: outcome})
 	}
 	if len(recoveries) > 0 {
 		run.updatedAt = timestamp

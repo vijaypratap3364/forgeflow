@@ -19,7 +19,8 @@ func TestTaskAttemptRetriesTransientFailureThenSucceeds(t *testing.T) {
 	})
 	attemptOne := startReliabilityAttempt(t, run, "worker-1", 10*time.Second)
 	temporary := errors.New("temporary failure")
-	outcome, err := run.completeTaskAttempt("task", "worker-1", attemptOne, "", Retryable(temporary))
+	taskRunID := TaskRunIDFor("run-1", "task")
+	outcome, err := run.completeTaskAttempt("task", taskRunID, "worker-1", attemptOne, "", Retryable(temporary))
 	if err != nil {
 		t.Fatalf("completeTaskAttempt() error = %v", err)
 	}
@@ -31,7 +32,7 @@ func TestTaskAttemptRetriesTransientFailureThenSucceeds(t *testing.T) {
 		t.Fatalf("task after transient failure = %#v", task)
 	}
 
-	duplicate, err := run.completeTaskAttempt("task", "worker-1", attemptOne, "duplicate", nil)
+	duplicate, err := run.completeTaskAttempt("task", taskRunID, "worker-1", attemptOne, "duplicate", nil)
 	if err != nil || duplicate != CompletionIgnored {
 		t.Fatalf("duplicate completion = %q, error %v, want ignored", duplicate, err)
 	}
@@ -47,7 +48,7 @@ func TestTaskAttemptRetriesTransientFailureThenSucceeds(t *testing.T) {
 	if attemptTwo == attemptOne {
 		t.Fatalf("attempt IDs are not unique: %q", attemptTwo)
 	}
-	outcome, err = run.completeTaskAttempt("task", "worker-2", attemptTwo, "success", nil)
+	outcome, err = run.completeTaskAttempt("task", taskRunID, "worker-2", attemptTwo, "success", nil)
 	if err != nil || outcome != CompletionSucceeded {
 		t.Fatalf("successful completion = %q, error %v", outcome, err)
 	}
@@ -103,13 +104,14 @@ func TestTaskAttemptDistinguishesTerminalFailureAndRetryExhaustion(t *testing.T)
 			now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
 			run := newReliabilityRun(t, &now, workflow.RetryPolicy{MaxAttempts: 2})
 			attempt := startReliabilityAttempt(t, run, "worker-1", time.Minute)
-			outcome, err := run.completeTaskAttempt("task", "worker-1", attempt, "", test.firstError(errors.New("failure")))
+			taskRunID := TaskRunIDFor("run-1", "task")
+			outcome, err := run.completeTaskAttempt("task", taskRunID, "worker-1", attempt, "", test.firstError(errors.New("failure")))
 			if err != nil || outcome != test.wantFirst {
 				t.Fatalf("first completion = %q, error %v, want %q", outcome, err, test.wantFirst)
 			}
 			if test.completeAgain {
 				attempt = startReliabilityAttempt(t, run, "worker-2", time.Minute)
-				outcome, err = run.completeTaskAttempt("task", "worker-2", attempt, "", Retryable(errors.New("still failing")))
+				outcome, err = run.completeTaskAttempt("task", taskRunID, "worker-2", attempt, "", Retryable(errors.New("still failing")))
 				if err != nil || outcome != CompletionFailed {
 					t.Fatalf("exhausting completion = %q, error %v, want failed", outcome, err)
 				}
@@ -133,6 +135,9 @@ func TestTaskLeaseHeartbeatAndExpiryRecovery(t *testing.T) {
 	now = now.Add(5 * time.Second)
 	if recoveries := run.recoverExpiredLeases(); len(recoveries) != 0 {
 		t.Fatalf("active lease was stolen: %v", recoveries)
+	}
+	if _, err := run.startTaskAttempt("task", "worker-2", 10*time.Second); err == nil {
+		t.Fatal("startTaskAttempt() allowed a second assignment under an active lease")
 	}
 	if err := run.recordWorkerHeartbeat("worker-1", 10*time.Second); err != nil {
 		t.Fatalf("recordWorkerHeartbeat() error = %v", err)
@@ -173,7 +178,7 @@ func TestExpiredLeaseDoesNotCorruptCompletedTask(t *testing.T) {
 	now := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
 	run := newReliabilityRun(t, &now, workflow.RetryPolicy{MaxAttempts: 2})
 	attempt := startReliabilityAttempt(t, run, "worker-1", time.Second)
-	if outcome, err := run.completeTaskAttempt("task", "worker-1", attempt, "done", nil); err != nil || outcome != CompletionSucceeded {
+	if outcome, err := run.completeTaskAttempt("task", TaskRunIDFor("run-1", "task"), "worker-1", attempt, "done", nil); err != nil || outcome != CompletionSucceeded {
 		t.Fatalf("completeTaskAttempt() = %q, error %v", outcome, err)
 	}
 	now = now.Add(time.Hour)

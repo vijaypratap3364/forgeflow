@@ -10,17 +10,23 @@ import (
 // RetryableTaskError marks a handler failure as transient. Unmarked handler
 // errors are terminal and are not retried.
 type RetryableTaskError struct {
-	Cause error
+	cause error
 }
 
 // Error returns the underlying transient failure message.
 func (e *RetryableTaskError) Error() string {
-	return e.Cause.Error()
+	if e == nil || e.cause == nil {
+		return "retryable task failure"
+	}
+	return e.cause.Error()
 }
 
 // Unwrap exposes the transient failure for errors.Is and errors.As.
 func (e *RetryableTaskError) Unwrap() error {
-	return e.Cause
+	if e == nil {
+		return nil
+	}
+	return e.cause
 }
 
 // Retryable marks a non-nil handler failure as eligible for retry.
@@ -28,7 +34,7 @@ func Retryable(cause error) error {
 	if cause == nil {
 		return nil
 	}
-	return &RetryableTaskError{Cause: cause}
+	return &RetryableTaskError{cause: cause}
 }
 
 // IsRetryable reports whether an error chain contains a retryable task marker.

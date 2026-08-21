@@ -35,14 +35,16 @@ Keep this stage in memory and independent of workers, databases, brokers, and HT
 - Reconstruct runs after restart without repeating completed tasks.
 - Keep storage paths configurable and repository tests isolated.
 
-## Stage 4 — Reliable attempts and distributed recovery semantics (next)
+## Stage 4 — Reliable attempts and recovery semantics (complete)
 
 - Model attempts, retry policy, backoff, leases, and idempotency keys.
 - Prevent duplicate claims and duplicate committed completion.
 - Track worker heartbeats and reclaim expired work.
 - Prove recovery behavior first with an in-memory implementation and controlled time.
 
-## Stage 5 — API and production storage
+The current implementation proves these semantics with identified in-process workers and the embedded Store. Cross-process claims and heartbeats remain part of the later PostgreSQL and remote-worker stages.
+
+## Stage 5 — API and production storage (next)
 
 - Add an HTTP API for workflow submission, inspection, and cancellation.
 - Define validation, error, pagination, and concurrency behavior before optimizing transport.
