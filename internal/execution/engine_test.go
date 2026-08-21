@@ -443,7 +443,7 @@ func TestEngineRecoverReexecutesInterruptedRunningTask(t *testing.T) {
 	snapshot.Tasks[0].AttemptCount = 1
 	snapshot.Tasks[0].UpdatedAt = interruptedAt
 	snapshot.Tasks[0].StartedAt = interruptedAt
-	if err := store.CreateRun(context.Background(), snapshot); err != nil {
+	if _, err := store.CreateRun(context.Background(), snapshot); err != nil {
 		t.Fatalf("CreateRun() error = %v", err)
 	}
 
@@ -569,26 +569,42 @@ func (store *memoryTestStore) LoadWorkflow(
 	return cloneDefinition(definition), found, nil
 }
 
-func (store *memoryTestStore) CreateRun(_ context.Context, snapshot WorkflowRunSnapshot) error {
+func (store *memoryTestStore) CreateRun(
+	_ context.Context,
+	snapshot WorkflowRunSnapshot,
+) (WorkflowRunSnapshot, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
 	if _, exists := store.runs[snapshot.ID]; exists {
-		return &RunAlreadyExistsError{RunID: snapshot.ID}
+		return WorkflowRunSnapshot{}, &RunAlreadyExistsError{RunID: snapshot.ID}
 	}
+	snapshot.Version = 1
 	store.runs[snapshot.ID] = cloneTestSnapshot(snapshot)
-	return nil
+	return cloneTestSnapshot(snapshot), nil
 }
 
-func (store *memoryTestStore) SaveRun(_ context.Context, snapshot WorkflowRunSnapshot) error {
+func (store *memoryTestStore) SaveRun(
+	_ context.Context,
+	snapshot WorkflowRunSnapshot,
+) (WorkflowRunSnapshot, error) {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
-	if _, exists := store.runs[snapshot.ID]; !exists {
-		return &RunNotFoundError{RunID: snapshot.ID}
+	current, exists := store.runs[snapshot.ID]
+	if !exists {
+		return WorkflowRunSnapshot{}, &RunNotFoundError{RunID: snapshot.ID}
 	}
+	if snapshot.Version != current.Version {
+		return WorkflowRunSnapshot{}, &RunVersionConflictError{
+			RunID:           snapshot.ID,
+			ExpectedVersion: snapshot.Version,
+			ActualVersion:   current.Version,
+		}
+	}
+	snapshot.Version++
 	store.runs[snapshot.ID] = cloneTestSnapshot(snapshot)
-	return nil
+	return cloneTestSnapshot(snapshot), nil
 }
 
 func (store *memoryTestStore) LoadRun(

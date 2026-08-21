@@ -264,20 +264,28 @@ func (store *observedStore) LoadWorkflow(
 	return store.delegate.LoadWorkflow(ctx, workflowID)
 }
 
-func (store *observedStore) CreateRun(ctx context.Context, snapshot execution.WorkflowRunSnapshot) error {
-	if err := store.delegate.CreateRun(ctx, snapshot); err != nil {
-		return err
+func (store *observedStore) CreateRun(
+	ctx context.Context,
+	snapshot execution.WorkflowRunSnapshot,
+) (execution.WorkflowRunSnapshot, error) {
+	stored, err := store.delegate.CreateRun(ctx, snapshot)
+	if err != nil {
+		return execution.WorkflowRunSnapshot{}, err
 	}
-	store.observe(snapshot)
-	return nil
+	store.observe(stored)
+	return stored, nil
 }
 
-func (store *observedStore) SaveRun(ctx context.Context, snapshot execution.WorkflowRunSnapshot) error {
-	if err := store.delegate.SaveRun(ctx, snapshot); err != nil {
-		return err
+func (store *observedStore) SaveRun(
+	ctx context.Context,
+	snapshot execution.WorkflowRunSnapshot,
+) (execution.WorkflowRunSnapshot, error) {
+	stored, err := store.delegate.SaveRun(ctx, snapshot)
+	if err != nil {
+		return execution.WorkflowRunSnapshot{}, err
 	}
-	store.observe(snapshot)
-	return nil
+	store.observe(stored)
+	return stored, nil
 }
 
 func (store *observedStore) LoadRun(

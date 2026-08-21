@@ -209,7 +209,7 @@ func TestWorkflowRunLifecycleTasksAndSSE(t *testing.T) {
 	assertStatus(t, status, http.StatusOK)
 	var runResponse RunResponse
 	decodeResponse(t, status, &runResponse)
-	if runResponse.Status != execution.WorkflowRunSucceeded || runResponse.Tasks.Succeeded != 1 {
+	if runResponse.Version == 0 || runResponse.Status != execution.WorkflowRunSucceeded || runResponse.Tasks.Succeeded != 1 {
 		t.Fatalf("run response = %#v", runResponse)
 	}
 

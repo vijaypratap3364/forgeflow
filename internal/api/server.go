@@ -234,7 +234,8 @@ func (server *Server) handleWorkflowRuns(writer http.ResponseWriter, request *ht
 		writeRequestError(writer, err)
 		return
 	}
-	if err := server.store.CreateRun(request.Context(), run.Snapshot()); err != nil {
+	stored, err := server.store.CreateRun(request.Context(), run.Snapshot())
+	if err != nil {
 		writeStoreError(writer, err)
 		return
 	}
@@ -247,7 +248,7 @@ func (server *Server) handleWorkflowRuns(writer http.ResponseWriter, request *ht
 		return
 	}
 	writer.Header().Set("Location", "/api/v1/runs/"+string(runID))
-	writeJSON(writer, http.StatusAccepted, runDTO(run.Snapshot()))
+	writeJSON(writer, http.StatusAccepted, runDTO(stored))
 }
 
 func (server *Server) handleRun(writer http.ResponseWriter, request *http.Request) {

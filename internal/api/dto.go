@@ -65,6 +65,7 @@ type CreateRunRequest struct {
 type RunResponse struct {
 	ID         execution.RunID             `json:"id"`
 	WorkflowID workflow.WorkflowID         `json:"workflow_id"`
+	Version    uint64                      `json:"version"`
 	Status     execution.WorkflowRunStatus `json:"status"`
 	CreatedAt  time.Time                   `json:"created_at"`
 	UpdatedAt  time.Time                   `json:"updated_at"`
@@ -234,6 +235,7 @@ func runDTO(snapshot execution.WorkflowRunSnapshot) RunResponse {
 	response := RunResponse{
 		ID:         snapshot.ID,
 		WorkflowID: snapshot.WorkflowID,
+		Version:    snapshot.Version,
 		Status:     snapshot.Status,
 		CreatedAt:  snapshot.CreatedAt,
 		UpdatedAt:  snapshot.UpdatedAt,

@@ -220,12 +220,16 @@ func newWatchingStore(store Store) *watchingStore {
 	return &watchingStore{Store: store, updates: make(chan WorkflowRunSnapshot, 256)}
 }
 
-func (store *watchingStore) SaveRun(ctx context.Context, snapshot WorkflowRunSnapshot) error {
-	if err := store.Store.SaveRun(ctx, snapshot); err != nil {
-		return err
+func (store *watchingStore) SaveRun(
+	ctx context.Context,
+	snapshot WorkflowRunSnapshot,
+) (WorkflowRunSnapshot, error) {
+	stored, err := store.Store.SaveRun(ctx, snapshot)
+	if err != nil {
+		return WorkflowRunSnapshot{}, err
 	}
-	store.updates <- cloneTestSnapshot(snapshot)
-	return nil
+	store.updates <- cloneTestSnapshot(stored)
+	return stored, nil
 }
 
 func waitForStoredTask(

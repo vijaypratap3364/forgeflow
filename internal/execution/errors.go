@@ -168,6 +168,24 @@ type RunAlreadyExistsError struct {
 	RunID RunID
 }
 
+// RunVersionConflictError reports an optimistic-concurrency conflict while
+// persisting a workflow run aggregate.
+type RunVersionConflictError struct {
+	RunID           RunID
+	ExpectedVersion uint64
+	ActualVersion   uint64
+}
+
+// Error returns a contextual description of the stale workflow run snapshot.
+func (e *RunVersionConflictError) Error() string {
+	return fmt.Sprintf(
+		"workflow run %q version conflict: expected %d, actual %d",
+		e.RunID,
+		e.ExpectedVersion,
+		e.ActualVersion,
+	)
+}
+
 // Error returns a contextual description of the duplicate run.
 func (e *RunAlreadyExistsError) Error() string {
 	return fmt.Sprintf("workflow run %q already exists", e.RunID)

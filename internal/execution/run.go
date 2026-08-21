@@ -71,6 +71,7 @@ type WorkflowRun struct {
 	mu         sync.RWMutex
 	id         RunID
 	definition workflow.WorkflowDefinition
+	version    uint64
 	status     WorkflowRunStatus
 	tasks      map[workflow.TaskID]TaskRun
 	workers    map[WorkerID]WorkerHeartbeat
@@ -201,12 +202,20 @@ func (run *WorkflowRun) Snapshot() WorkflowRunSnapshot {
 	return WorkflowRunSnapshot{
 		ID:         run.id,
 		WorkflowID: run.definition.ID,
+		Version:    run.version,
 		Status:     run.status,
 		CreatedAt:  run.createdAt,
 		UpdatedAt:  run.updatedAt,
 		Tasks:      run.sortedTasksLocked(),
 		Workers:    run.sortedWorkersLocked(),
 	}
+}
+
+func (run *WorkflowRun) setPersistedVersion(version uint64) {
+	run.mu.Lock()
+	defer run.mu.Unlock()
+
+	run.version = version
 }
 
 func (run *WorkflowRun) taskStatus(taskID workflow.TaskID) (TaskRunStatus, error) {

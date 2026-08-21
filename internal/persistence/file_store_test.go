@@ -33,7 +33,8 @@ func TestFileStorePersistsDefinitionsAndRunsAcrossReopen(t *testing.T) {
 		t.Fatalf("NewWorkflowRun() error = %v", err)
 	}
 	created := run.Snapshot()
-	if err := store.CreateRun(context.Background(), created); err != nil {
+	created, err = store.CreateRun(context.Background(), created)
+	if err != nil {
 		t.Fatalf("CreateRun() error = %v", err)
 	}
 
@@ -43,7 +44,8 @@ func TestFileStorePersistsDefinitionsAndRunsAcrossReopen(t *testing.T) {
 	updated.UpdatedAt = created.UpdatedAt.Add(time.Second)
 	updated.Tasks[0].Status = execution.TaskRunReady
 	updated.Tasks[0].UpdatedAt = updated.UpdatedAt
-	if err := store.SaveRun(context.Background(), updated); err != nil {
+	updated, err = store.SaveRun(context.Background(), updated)
+	if err != nil {
 		t.Fatalf("SaveRun() error = %v", err)
 	}
 
@@ -94,7 +96,8 @@ func TestFileStoreRepositoryErrors(t *testing.T) {
 		t.Fatalf("NewWorkflowRun() error = %v", err)
 	}
 	snapshot := run.Snapshot()
-	if err := store.CreateRun(context.Background(), snapshot); err != nil {
+	snapshot, err = store.CreateRun(context.Background(), snapshot)
+	if err != nil {
 		t.Fatalf("CreateRun() error = %v", err)
 	}
 
@@ -109,7 +112,7 @@ func TestFileStoreRepositoryErrors(t *testing.T) {
 
 	t.Run("duplicate run", func(t *testing.T) {
 		var target *execution.RunAlreadyExistsError
-		if err := store.CreateRun(context.Background(), snapshot); !errors.As(err, &target) {
+		if _, err := store.CreateRun(context.Background(), snapshot); !errors.As(err, &target) {
 			t.Fatalf("CreateRun() error = %v, want *RunAlreadyExistsError", err)
 		}
 	})
@@ -121,7 +124,7 @@ func TestFileStoreRepositoryErrors(t *testing.T) {
 			missing.Tasks[index].TaskRunID = execution.TaskRunIDFor(missing.ID, missing.Tasks[index].TaskID)
 		}
 		var target *execution.RunNotFoundError
-		if err := store.SaveRun(context.Background(), missing); !errors.As(err, &target) {
+		if _, err := store.SaveRun(context.Background(), missing); !errors.As(err, &target) {
 			t.Fatalf("SaveRun() error = %v, want *RunNotFoundError", err)
 		}
 	})
@@ -130,11 +133,12 @@ func TestFileStoreRepositoryErrors(t *testing.T) {
 		missing := snapshot
 		missing.ID = "another-run"
 		missing.WorkflowID = "missing-workflow"
+		missing.Version = 0
 		for index := range missing.Tasks {
 			missing.Tasks[index].TaskRunID = execution.TaskRunIDFor(missing.ID, missing.Tasks[index].TaskID)
 		}
 		var target *execution.WorkflowNotFoundError
-		if err := store.CreateRun(context.Background(), missing); !errors.As(err, &target) {
+		if _, err := store.CreateRun(context.Background(), missing); !errors.As(err, &target) {
 			t.Fatalf("CreateRun() error = %v, want *WorkflowNotFoundError", err)
 		}
 	})
@@ -146,6 +150,112 @@ func TestFileStoreRepositoryErrors(t *testing.T) {
 			t.Fatalf("LoadRun() error = %v, want context.Canceled", err)
 		}
 	})
+}
+
+func TestFileStoreRejectsStaleRunSnapshot(t *testing.T) {
+	t.Parallel()
+
+	store, err := OpenFileStore(filepath.Join(t.TempDir(), "forgeflow.ffdb"))
+	if err != nil {
+		t.Fatalf("OpenFileStore() error = %v", err)
+	}
+	definition := repositoryWorkflow()
+	if err := store.SaveWorkflow(context.Background(), definition); err != nil {
+		t.Fatalf("SaveWorkflow() error = %v", err)
+	}
+	run, err := execution.NewWorkflowRun("versioned-run", definition)
+	if err != nil {
+		t.Fatalf("NewWorkflowRun() error = %v", err)
+	}
+	created, err := store.CreateRun(context.Background(), run.Snapshot())
+	if err != nil {
+		t.Fatalf("CreateRun() error = %v", err)
+	}
+	if created.Version != 1 {
+		t.Fatalf("created version = %d, want 1", created.Version)
+	}
+
+	updated := created
+	updated.Tasks = append([]execution.TaskRun(nil), created.Tasks...)
+	updated.Status = execution.WorkflowRunRunning
+	updated.UpdatedAt = created.UpdatedAt.Add(time.Second)
+	updated.Tasks[0].Status = execution.TaskRunReady
+	updated.Tasks[0].UpdatedAt = updated.UpdatedAt
+	stored, err := store.SaveRun(context.Background(), updated)
+	if err != nil {
+		t.Fatalf("SaveRun() error = %v", err)
+	}
+	if stored.Version != 2 {
+		t.Fatalf("stored version = %d, want 2", stored.Version)
+	}
+
+	stale := updated
+	stale.UpdatedAt = updated.UpdatedAt.Add(time.Second)
+	var conflict *execution.RunVersionConflictError
+	if _, err := store.SaveRun(context.Background(), stale); !errors.As(err, &conflict) {
+		t.Fatalf("stale SaveRun() error = %v, want *RunVersionConflictError", err)
+	}
+	if conflict.ExpectedVersion != 1 || conflict.ActualVersion != 2 {
+		t.Fatalf("version conflict = %#v, want expected 1 actual 2", conflict)
+	}
+	loaded, found, err := store.LoadRun(context.Background(), created.ID)
+	if err != nil || !found {
+		t.Fatalf("LoadRun() = found %v, error %v", found, err)
+	}
+	if !reflect.DeepEqual(loaded, stored) {
+		t.Fatalf("loaded snapshot changed after stale save: got %#v, want %#v", loaded, stored)
+	}
+}
+
+func TestFileStoreReplaysLegacyUnversionedRunRecords(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "forgeflow.ffdb")
+	store, err := OpenFileStore(path)
+	if err != nil {
+		t.Fatalf("OpenFileStore() error = %v", err)
+	}
+	definition := repositoryWorkflow()
+	if err := store.SaveWorkflow(context.Background(), definition); err != nil {
+		t.Fatalf("SaveWorkflow() error = %v", err)
+	}
+	run, err := execution.NewWorkflowRun("legacy-run", definition)
+	if err != nil {
+		t.Fatalf("NewWorkflowRun() error = %v", err)
+	}
+	created := run.Snapshot()
+	if err := store.appendRecord(journalRecord{
+		Version:   journalVersion,
+		Operation: operationCreateRun,
+		Run:       &created,
+	}); err != nil {
+		t.Fatalf("append legacy create record: %v", err)
+	}
+	updated := created
+	updated.Tasks = append([]execution.TaskRun(nil), created.Tasks...)
+	updated.Status = execution.WorkflowRunRunning
+	updated.UpdatedAt = created.UpdatedAt.Add(time.Second)
+	updated.Tasks[0].Status = execution.TaskRunReady
+	updated.Tasks[0].UpdatedAt = updated.UpdatedAt
+	if err := store.appendRecord(journalRecord{
+		Version:   journalVersion,
+		Operation: operationSaveRun,
+		Run:       &updated,
+	}); err != nil {
+		t.Fatalf("append legacy save record: %v", err)
+	}
+
+	reopened, err := OpenFileStore(path)
+	if err != nil {
+		t.Fatalf("reopen OpenFileStore() error = %v", err)
+	}
+	loaded, found, err := reopened.LoadRun(context.Background(), created.ID)
+	if err != nil || !found {
+		t.Fatalf("LoadRun() = found %v, error %v", found, err)
+	}
+	if loaded.Version != 2 {
+		t.Fatalf("legacy replay version = %d, want 2", loaded.Version)
+	}
 }
 
 func TestFileStoreSaveWorkflowIsIdempotent(t *testing.T) {
@@ -346,17 +456,18 @@ type interruptAfterPartialStore struct {
 func (store *interruptAfterPartialStore) SaveRun(
 	ctx context.Context,
 	snapshot execution.WorkflowRunSnapshot,
-) error {
+) (execution.WorkflowRunSnapshot, error) {
 	if store.interrupted.Load() {
-		return store.cause
+		return execution.WorkflowRunSnapshot{}, store.cause
 	}
 	if storedTaskStatus(snapshot, "a") == execution.TaskRunSucceeded &&
 		storedTaskStatus(snapshot, "b") == execution.TaskRunReady {
-		if err := store.Store.SaveRun(ctx, snapshot); err != nil {
-			return err
+		stored, err := store.Store.SaveRun(ctx, snapshot)
+		if err != nil {
+			return execution.WorkflowRunSnapshot{}, err
 		}
 		store.interrupted.Store(true)
-		return store.cause
+		return stored, store.cause
 	}
 	return store.Store.SaveRun(ctx, snapshot)
 }

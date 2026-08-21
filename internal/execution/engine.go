@@ -100,7 +100,11 @@ func (engine *Engine) Execute(
 	if err := engine.store.SaveWorkflow(durabilityContext, definition); err != nil {
 		return nil, persistenceError("save workflow definition", runID, err)
 	}
-	if err := engine.store.CreateRun(durabilityContext, run.Snapshot()); err != nil {
+	createdSnapshot, err := engine.store.CreateRun(durabilityContext, run.Snapshot())
+	if err != nil {
+		return nil, persistenceError("create workflow run", runID, err)
+	}
+	if err := applyPersistedVersion(run, run.Snapshot(), createdSnapshot); err != nil {
 		return nil, persistenceError("create workflow run", runID, err)
 	}
 
@@ -596,9 +600,33 @@ func (engine *Engine) cancelRun(
 }
 
 func (engine *Engine) saveRun(ctx context.Context, run *WorkflowRun, operation string) error {
-	if err := engine.store.SaveRun(ctx, run.Snapshot()); err != nil {
+	candidate := run.Snapshot()
+	stored, err := engine.store.SaveRun(ctx, candidate)
+	if err != nil {
 		return persistenceError(operation, run.id, err)
 	}
+	if err := applyPersistedVersion(run, candidate, stored); err != nil {
+		return persistenceError(operation, run.id, err)
+	}
+	return nil
+}
+
+func applyPersistedVersion(
+	run *WorkflowRun,
+	candidate WorkflowRunSnapshot,
+	stored WorkflowRunSnapshot,
+) error {
+	if stored.ID != candidate.ID || stored.WorkflowID != candidate.WorkflowID {
+		return errors.New("store returned a different workflow run after persistence")
+	}
+	if stored.Version != candidate.Version+1 {
+		return fmt.Errorf(
+			"store returned workflow run version %d after version %d",
+			stored.Version,
+			candidate.Version,
+		)
+	}
+	run.setPersistedVersion(stored.Version)
 	return nil
 }
 

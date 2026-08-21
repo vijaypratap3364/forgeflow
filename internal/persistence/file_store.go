@@ -128,72 +128,95 @@ func (store *FileStore) LoadWorkflow(
 	return cloneDefinition(definition), true, nil
 }
 
-// CreateRun atomically creates a run snapshot and rejects duplicate run IDs.
-func (store *FileStore) CreateRun(ctx context.Context, snapshot execution.WorkflowRunSnapshot) error {
+// CreateRun atomically creates a run snapshot at version one and rejects
+// duplicate run IDs.
+func (store *FileStore) CreateRun(
+	ctx context.Context,
+	snapshot execution.WorkflowRunSnapshot,
+) (execution.WorkflowRunSnapshot, error) {
 	if err := contextError(ctx); err != nil {
-		return err
+		return execution.WorkflowRunSnapshot{}, err
 	}
 	if err := snapshot.Validate(); err != nil {
-		return fmt.Errorf("create workflow run: %w", err)
+		return execution.WorkflowRunSnapshot{}, fmt.Errorf("create workflow run: %w", err)
 	}
-
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if _, exists := store.runs[snapshot.ID]; exists {
-		return &execution.RunAlreadyExistsError{RunID: snapshot.ID}
+		return execution.WorkflowRunSnapshot{}, &execution.RunAlreadyExistsError{RunID: snapshot.ID}
+	}
+	if snapshot.Version != 0 {
+		return execution.WorkflowRunSnapshot{}, fmt.Errorf(
+			"create workflow run %q: initial version must be zero",
+			snapshot.ID,
+		)
 	}
 	if err := store.validateRunDefinition(snapshot); err != nil {
-		return err
+		return execution.WorkflowRunSnapshot{}, err
 	}
 	if err := contextError(ctx); err != nil {
-		return err
+		return execution.WorkflowRunSnapshot{}, err
 	}
 
 	snapshot = cloneSnapshot(snapshot)
+	snapshot.Version = 1
 	record := journalRecord{
 		Version:   journalVersion,
 		Operation: operationCreateRun,
 		Run:       &snapshot,
 	}
 	if err := store.appendRecord(record); err != nil {
-		return err
+		return execution.WorkflowRunSnapshot{}, err
 	}
 	store.runs[snapshot.ID] = snapshot
-	return nil
+	return cloneSnapshot(snapshot), nil
 }
 
-// SaveRun atomically replaces the latest snapshot for an existing run.
-func (store *FileStore) SaveRun(ctx context.Context, snapshot execution.WorkflowRunSnapshot) error {
+// SaveRun atomically replaces the latest snapshot when its expected Version is
+// current, then returns the stored snapshot with the next version.
+func (store *FileStore) SaveRun(
+	ctx context.Context,
+	snapshot execution.WorkflowRunSnapshot,
+) (execution.WorkflowRunSnapshot, error) {
 	if err := contextError(ctx); err != nil {
-		return err
+		return execution.WorkflowRunSnapshot{}, err
 	}
 	if err := snapshot.Validate(); err != nil {
-		return fmt.Errorf("save workflow run: %w", err)
+		return execution.WorkflowRunSnapshot{}, fmt.Errorf("save workflow run: %w", err)
 	}
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if _, exists := store.runs[snapshot.ID]; !exists {
-		return &execution.RunNotFoundError{RunID: snapshot.ID}
+	current, exists := store.runs[snapshot.ID]
+	if !exists {
+		return execution.WorkflowRunSnapshot{}, &execution.RunNotFoundError{RunID: snapshot.ID}
+	}
+	if snapshot.Version != current.Version {
+		return execution.WorkflowRunSnapshot{}, &execution.RunVersionConflictError{
+			RunID:           snapshot.ID,
+			ExpectedVersion: snapshot.Version,
+			ActualVersion:   current.Version,
+		}
 	}
 	if err := store.validateRunDefinition(snapshot); err != nil {
-		return err
+		return execution.WorkflowRunSnapshot{}, err
 	}
 	if err := contextError(ctx); err != nil {
-		return err
+		return execution.WorkflowRunSnapshot{}, err
 	}
 
 	snapshot = cloneSnapshot(snapshot)
+	snapshot.Version++
 	record := journalRecord{
 		Version:   journalVersion,
 		Operation: operationSaveRun,
 		Run:       &snapshot,
 	}
 	if err := store.appendRecord(record); err != nil {
-		return err
+		return execution.WorkflowRunSnapshot{}, err
 	}
 	store.runs[snapshot.ID] = snapshot
-	return nil
+	return cloneSnapshot(snapshot), nil
 }
 
 // LoadRun returns a defensive copy of a run snapshot when it exists.
@@ -337,20 +360,40 @@ func (store *FileStore) applyRecord(record journalRecord) error {
 		if record.Run == nil || record.Workflow != nil {
 			return errors.New("replay ForgeFlow journal: malformed workflow run record")
 		}
-		if err := record.Run.Validate(); err != nil {
+		run := cloneSnapshot(*record.Run)
+		current, exists := store.runs[run.ID]
+		if run.Version == 0 {
+			// Journals created before optimistic versioning did not encode a run
+			// version. Replay assigns their revisions in record order.
+			run.Version = 1
+			if exists {
+				run.Version = current.Version + 1
+			}
+		}
+		if err := run.Validate(); err != nil {
 			return fmt.Errorf("replay ForgeFlow workflow run: %w", err)
 		}
-		if err := store.validateRunDefinition(*record.Run); err != nil {
+		if err := store.validateRunDefinition(run); err != nil {
 			return fmt.Errorf("replay ForgeFlow workflow run: %w", err)
 		}
-		_, exists := store.runs[record.Run.ID]
 		if record.Operation == operationCreateRun && exists {
-			return &execution.RunAlreadyExistsError{RunID: record.Run.ID}
+			return &execution.RunAlreadyExistsError{RunID: run.ID}
 		}
 		if record.Operation == operationSaveRun && !exists {
-			return &execution.RunNotFoundError{RunID: record.Run.ID}
+			return &execution.RunNotFoundError{RunID: run.ID}
 		}
-		store.runs[record.Run.ID] = cloneSnapshot(*record.Run)
+		if record.Operation == operationCreateRun && run.Version != 1 {
+			return fmt.Errorf("replay ForgeFlow workflow run %q: create version is %d, want 1", run.ID, run.Version)
+		}
+		if record.Operation == operationSaveRun && run.Version != current.Version+1 {
+			return fmt.Errorf(
+				"replay ForgeFlow workflow run %q: version is %d, want %d",
+				run.ID,
+				run.Version,
+				current.Version+1,
+			)
+		}
+		store.runs[run.ID] = run
 		return nil
 
 	default:

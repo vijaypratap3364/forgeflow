@@ -9,12 +9,15 @@ import (
 )
 
 // Store is the durability boundary used by the execution engine. Implementations
-// must make each mutation atomic from a caller's perspective.
+// must make each mutation atomic from a caller's perspective. CreateRun accepts
+// an unpersisted version-zero aggregate and returns version one. SaveRun treats
+// the supplied Version as an optimistic-concurrency expectation and returns the
+// stored aggregate with that version advanced by one.
 type Store interface {
 	SaveWorkflow(context.Context, workflow.WorkflowDefinition) error
 	LoadWorkflow(context.Context, workflow.WorkflowID) (workflow.WorkflowDefinition, bool, error)
-	CreateRun(context.Context, WorkflowRunSnapshot) error
-	SaveRun(context.Context, WorkflowRunSnapshot) error
+	CreateRun(context.Context, WorkflowRunSnapshot) (WorkflowRunSnapshot, error)
+	SaveRun(context.Context, WorkflowRunSnapshot) (WorkflowRunSnapshot, error)
 	LoadRun(context.Context, RunID) (WorkflowRunSnapshot, bool, error)
 }
 
@@ -23,6 +26,7 @@ type Store interface {
 type WorkflowRunSnapshot struct {
 	ID         RunID
 	WorkflowID workflow.WorkflowID
+	Version    uint64
 	Status     WorkflowRunStatus
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
@@ -220,6 +224,7 @@ func restoreWorkflowRun(
 	return &WorkflowRun{
 		id:         snapshot.ID,
 		definition: cloneDefinition(definition),
+		version:    snapshot.Version,
 		status:     snapshot.Status,
 		tasks:      tasks,
 		workers:    workers,
