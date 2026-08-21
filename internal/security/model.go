@@ -221,14 +221,3 @@ func validName(value string) bool {
 	trimmed := strings.TrimSpace(value)
 	return trimmed != "" && len(trimmed) <= maxNameLength
 }
-
-func cloneAuditEvent(event AuditEvent) AuditEvent {
-	clone := event
-	if event.Metadata != nil {
-		clone.Metadata = make(map[string]string, len(event.Metadata))
-		for key, value := range event.Metadata {
-			clone.Metadata[key] = value
-		}
-	}
-	return clone
-}

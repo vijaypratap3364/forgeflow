@@ -748,7 +748,7 @@ func executeBrokerWorker(
 			heartbeatGroup.Wait()
 			select {
 			case <-ctx.Done():
-			case lost <- workerLostEvent{workerID: identity.workerID, slot: identity.slot}:
+			case lost <- workerLostEvent(identity):
 			}
 			return
 		}

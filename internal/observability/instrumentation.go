@@ -9,6 +9,7 @@ import (
 
 	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 // Instrumentation groups explicitly injected observability dependencies.
@@ -35,7 +36,7 @@ func NewInstrumentation(
 		metrics = NewMetrics()
 	}
 	if provider == nil {
-		provider = trace.NewNoopTracerProvider()
+		provider = noop.NewTracerProvider()
 	}
 	if propagator == nil {
 		propagator = propagation.NewCompositeTextMapPropagator(

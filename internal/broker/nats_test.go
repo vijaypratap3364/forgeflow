@@ -51,6 +51,7 @@ func TestNATSConfigValidation(t *testing.T) {
 }
 
 func TestOpenNATSBrokerRejectsNilOrCancelledContextBeforeConnecting(t *testing.T) {
+	//lint:ignore SA1012 This test deliberately verifies the public nil-context guard.
 	if _, err := OpenNATSBroker(nil, DefaultNATSConfig()); err == nil {
 		t.Fatal("OpenNATSBroker(nil) error = nil")
 	}

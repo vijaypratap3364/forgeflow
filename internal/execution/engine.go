@@ -433,17 +433,6 @@ func requireDefinition(
 	return definitions[taskID]
 }
 
-func popReadyTask(ready map[workflow.TaskID]workflow.TaskDefinition) workflow.TaskDefinition {
-	taskIDs := make([]workflow.TaskID, 0, len(ready))
-	for taskID := range ready {
-		taskIDs = append(taskIDs, taskID)
-	}
-	sort.Slice(taskIDs, func(left, right int) bool { return taskIDs[left] < taskIDs[right] })
-	task := ready[taskIDs[0]]
-	delete(ready, task.ID)
-	return task
-}
-
 func sortTasks(tasks []workflow.TaskDefinition) {
 	sort.Slice(tasks, func(left, right int) bool {
 		return tasks[left].ID < tasks[right].ID

@@ -13,6 +13,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 )
 
 const (
@@ -62,7 +63,7 @@ func OpenTracerProvider(
 
 	exporterName := strings.ToLower(strings.TrimSpace(config.Exporter))
 	if exporterName == TraceExporterNone {
-		return trace.NewNoopTracerProvider(), func(context.Context) error { return nil }, nil
+		return noop.NewTracerProvider(), func(context.Context) error { return nil }, nil
 	}
 
 	tracingResource, err := resource.New(
