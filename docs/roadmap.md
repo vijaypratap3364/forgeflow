@@ -60,12 +60,15 @@ The current API addresses individual resources by stable ID; collection listing 
 - Protect concurrent aggregate transitions with transactional optimistic version checks.
 - Exercise the adapter against a temporary PostgreSQL service in GitHub Actions, not on the constrained development machine.
 
-## Stage 7 — Distributed messaging and remote workers
+## Stage 7 — Distributed messaging (complete)
 
-- Introduce a broker interface and a production-grade broker adapter.
-- Run workers as separate processes and make delivery/redelivery behavior explicit.
-- Add integration and failure-injection tests in CI or remote infrastructure.
+- Introduce a broker interface with in-memory and production JetStream adapters.
+- Route scheduler dispatch and worker receipt through durable, acknowledged messages.
+- Make the persisted lease, completion, acknowledgement, and redelivery ordering explicit.
+- Add broker contract, redelivery, reconnect, engine-ordering, and integration tests in CI.
 - Do not require Kafka or another heavy broker on the constrained development machine.
+
+The transport is process-neutral, but the current executable still hosts worker goroutines with each run's scheduler. Extracting that runtime into a separately deployable worker and adding automatic cross-process run discovery are explicit follow-up work; the project does not claim those pieces are already present.
 
 ## Stage 8 — Operations and scale evidence
 

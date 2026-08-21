@@ -4,20 +4,23 @@
 
 ForgeFlow will execute task graphs reliably across multiple workers. The eventual design separates workflow semantics from infrastructure so that scheduling rules remain testable without a broker, database, or network services.
 
-This document separates the components that exist today from the later distributed target.
+This document separates the components that exist today from the remaining distributed-runtime work.
 
 ## Current implementation
 
-Stage 6 contains:
+Stage 7 contains:
 
-- a small dependency surface: the Go standard library plus native `pgx` for optional PostgreSQL access;
+- a small dependency surface: the Go standard library plus native `pgx` and `nats.go` clients for optional PostgreSQL and NATS access;
 - stable workflow and task identifier types plus in-memory definitions;
 - typed, machine-classifiable validation errors with contextual messages;
 - validation for identifiers, names, task uniqueness, dependency references, repeated edges, self-dependencies, and cycles;
 - deterministic topological ordering, root-task discovery, and ready-task discovery;
 - separate workflow-definition, workflow-run, and task-run models with enforced state transitions;
 - a synchronous scheduler that unlocks successful dependency chains;
-- per-run in-memory queues and configurable worker pools using goroutines and channels;
+- a task `Broker` boundary used by both scheduler and workers;
+- a concurrency-safe `InMemoryBroker` for normal tests and lightweight local use;
+- a NATS JetStream adapter using durable pull consumers, explicit acknowledgements, file-backed work-queue retention, and stable message IDs;
+- per-run configurable worker pools using goroutines, broker deliveries, and channels for local scheduler coordination;
 - a concurrency-safe registry of context-aware task handlers;
 - safe built-in no-op, delay, and uppercase handlers;
 - a narrow persistence interface owned by the execution layer;
@@ -37,25 +40,26 @@ Stage 6 contains:
 - durable aggregate and task-level status reads;
 - replayable live Server-Sent Events derived from persisted transitions;
 - liveness, readiness, configurable process settings, and graceful shutdown;
-- handler tests built with `httptest` plus deterministic domain and engine tests.
+- handler tests built with `httptest` plus deterministic domain, engine, and broker contract tests;
+- opt-in JetStream integration tests run against a pinned standalone NATS server in GitHub Actions.
 
-There is currently no remote worker, messaging system, authentication, automatic cross-process recovery controller, metrics/tracing stack, or browser UI. The executable runs the local HTTP service with the embedded store by default and can instead connect to PostgreSQL when explicitly configured.
+There is currently no separately deployable worker executable, automatic cross-process recovery controller, authentication, metrics/tracing stack, or browser UI. The executable runs the local HTTP service with the embedded store and in-memory broker by default. It can independently select PostgreSQL and NATS when explicitly configured. The network broker boundary is current, while extracting the worker runtime from the API/scheduler process is later work.
 
 ## Eventual component boundaries
 
 | Component | Responsibility | Status |
 | --- | --- | --- |
 | Workflow domain | Define workflows, tasks, dependencies, and DAG invariants | Current |
-| Scheduler | Identify, lease, retry, and dispatch ready tasks without violating dependencies | Current, in process |
-| Dispatcher | Offer runnable tasks to workers through a queue | Current, in-memory only |
-| Worker runtime | Execute registered handlers, heartbeat, and report identified attempt outcomes | Current, in process |
+| Scheduler | Identify, lease, retry, and dispatch ready tasks without violating dependencies | Current; one scheduler loop per active run |
+| Dispatcher | Offer runnable attempts through implementation-neutral durable delivery | Current, Broker boundary |
+| Worker runtime | Receive broker deliveries, execute registered handlers, heartbeat, and report identified outcomes | Current in the scheduler process; standalone process future |
 | State store | Persist definitions, attempts, leases, heartbeats, and aggregate run state | Current, embedded journal or PostgreSQL |
-| Messaging boundary | Decouple dispatch and execution through a broker adapter | Future |
+| Messaging boundary | Decouple task dispatch through competing consumers | Current, memory or NATS JetStream |
 | Recovery controller | Detect expired leases and make abandoned work eligible again | Current in scheduler; distributed controller future |
 | API | Accept workflows; create, inspect, stream, and cancel runs | Current, HTTP/JSON and SSE |
 | Observability | Provide structured logs, metrics, traces, and operational diagnostics | Future |
 
-Messaging will receive a narrow interface when that boundary becomes real. The PostgreSQL implementation remains behind the existing Store interface; a production message broker will arrive only after its multi-process semantics are understood and covered by contract tests.
+The persistence and messaging choices are independent boundaries. Lightweight local operation uses `FileStore` plus `InMemoryBroker`; a distributed deployment should use PostgreSQL plus NATS JetStream. `FileStore` remains a single-process component and must not be shared by multiple ForgeFlow processes merely because NATS is network-accessible.
 
 ## Current graph algorithms
 
@@ -71,26 +75,39 @@ HTTP client ---- JSON/SSE ---- API + run manager
                     persist pending run, then recover
                                   |
                                   v
-                             Scheduler loop <------- snapshot
-                              |     ^     |              ^
-                       lease  |     |     | persist      |
-                       + job  |     |     v              |
-                              | heartbeats/results  execution.Store
-                              v     |                    |
-                         identified workers        Store boundary
-                                                  /            \
-                                          FileStore         PostgreSQL
+                         Scheduler loop <---------- snapshot
+                           |       ^                    ^
+                    publish|       |claim/result       | persist
+                           v       |                    v
+                       Broker boundary             execution.Store
+                       /             \             /             \
+              InMemoryBroker     NATS JetStream  FileStore     PostgreSQL
+                       \             /
+                        identified workers
+                        receive/ack/progress
 ```
 
-`Engine.Execute` creates an isolated `WorkflowRun`, resolves every handler before accepting the run, saves its immutable definition and initial snapshot, derives a run context from the caller, and starts the configured number of workers. Each `Execute` call owns its queue and worker goroutines, so the same engine can execute multiple workflow runs concurrently without sharing mutable run state.
+`Engine.Execute` creates an isolated `WorkflowRun`, resolves every handler before accepting the run, saves its immutable definition and initial snapshot, derives a run context from the caller, and starts the configured number of workers. Each `Execute` call owns its scheduler loop and worker goroutines. Task transport is shared only through the configured concurrency-safe `Broker`, so the same engine can execute multiple workflow runs concurrently without sharing mutable run aggregates.
 
-The scheduler is the only component that decides task transitions and dispatch. It maintains the set of succeeded task IDs and asks the workflow domain for newly ready tasks after each success. Only pending tasks are promoted to ready. An available identified worker receives a task only after the aggregate containing its attempt ID and lease has been flushed. Worker results carry the worker, task-run, and attempt identities. A matching completion moves the task to succeeded, retry-wait, or failed and may unlock downstream dependencies; the resulting aggregate snapshot is flushed before further dispatch.
+The scheduler is the only component that decides task transitions and dispatch. It maintains the set of succeeded task IDs and asks the workflow domain for newly ready tasks after each success. Only pending tasks are promoted to ready, and that ready transition is persisted before a message is published. Each message ID is the stable ID of the next task attempt. Receiving a message is not authority to execute: the scheduler validates its run, task-run, and attempt identities and flushes the aggregate containing the worker's lease before authorizing the handler. Worker results carry the worker, task-run, and attempt identities. A matching completion moves the task to succeeded, retry-wait, or failed and may unlock downstream dependencies; the resulting aggregate snapshot is flushed before the delivery is acknowledged.
 
 Task transitions are `pending -> ready -> running -> succeeded|retry_wait|failed`, with `retry_wait -> ready` when backoff elapses. Cancellation may move any nonterminal task to `canceled`. Workflow transitions are `pending -> running -> succeeded|failed|canceled`, with pending-to-canceled allowed when the caller's context is already done.
 
 Unmarked handler errors are terminal. A marked `RetryableTaskError` schedules another attempt only while `AttemptCount < MaxAttempts`; a zero maximum preserves the default of one total attempt. Delay starts at `InitialBackoff`, doubles after each completed attempt, and is capped by `MaxBackoff` when configured. Exhaustion or a terminal error invokes the fail-fast policy: unfinished tasks are canceled and the workflow fails. Handlers receive `context.Context` and are required to return promptly when it is canceled; Go cannot forcibly stop a handler that ignores its context.
 
 The engine clock and timers are interfaces. Production uses the standard library clock, while tests advance controlled time to prove backoff, heartbeat, and expiry behavior without real sleeps.
+
+## Task broker boundary
+
+`internal/broker` defines five transport operations: publish a stable task message, receive one delivery for a durable competing-consumer subscription, acknowledge completed delivery, negatively acknowledge work that should be offered again, and report progress for long-running work. Message bodies carry run, task, task-run, and attempt identities; broker subjects and durable names use stable SHA-256-derived tokens so user-controlled identifiers cannot inject NATS wildcards. The scheduler and workers know only this interface.
+
+`InMemoryBroker` keeps a process-lifetime message log, makes identical publication of a stable message ID idempotent, and divides a subscription's deliveries among competing receivers. It is deterministic and concurrency-safe, so all ordinary engine tests exercise the real broker boundary without a service. It does not pretend to survive process exit or emulate a server-side acknowledgement timer. Worker cancellation and injected disappearance explicitly nack active in-memory deliveries.
+
+`NATSBroker` creates or reconciles one file-backed JetStream stream using work-queue retention. Each workflow run maps to a non-overlapping subject and one durable pull consumer; all workers for that run compete on the same consumer. The adapter waits for a JetStream publish acknowledgement before reporting publication success, uses `Nats-Msg-Id` with the stable attempt ID for windowed publish deduplication, requires explicit consumer acknowledgements, nacks work for immediate redelivery, and maps persisted worker heartbeats to JetStream in-progress acknowledgements. Broker redelivery is unlimited by default because ForgeFlow's persisted retry policy, rather than a broker delivery counter, decides when logical task attempts are exhausted.
+
+JetStream's duplicate window is an optimization, not the idempotency authority. A delayed repeat can arrive after that window, and an acknowledgement can be lost after the database commit. Every delivery is therefore checked against persisted task status, attempt ID, and lease state. A completed or stale attempt is acknowledged without invoking its handler. The NATS server retains unacknowledged messages and redelivers them when `AckWait` expires; the default one-minute acknowledgement deadline is longer than the engine's default heartbeat interval, and each durable lease renewal is followed by an in-progress acknowledgement that resets that deadline.
+
+The current executable composes the scheduler and worker goroutines in one process even when JetStream is selected. The broker protocol is network-capable and the persistence ordering is suitable for cross-process transport, but shipping a standalone worker runtime requires a separate lifecycle and narrower remote claim/completion operations. Documentation does not label that remaining extraction as already implemented.
 
 ## HTTP API and process lifecycle
 
@@ -137,22 +154,24 @@ If a local worker disappears, its heartbeat stops and its slot is supervised wit
 
 ## Delivery and execution semantics
 
-- **At-most-once** means an operation is never repeated, but loss may prevent it from happening. ForgeFlow provides at-most-once *state application per attempt ID*: after a matching attempt completion changes task state, duplicate or stale completions are no-ops. A valid lease also permits only one current assignment in the single-process scheduler.
-- **At-least-once** means work may repeat so it is not silently abandoned. ForgeFlow task-handler execution is at-least-once across configured retries and expired-lease recovery. A worker might perform an external side effect and disappear before persisting completion; the replacement attempt can perform that effect again.
+- **At-most-once** means an operation is never repeated, but loss may prevent it from happening. ForgeFlow provides at-most-once *state application per attempt ID*: after a matching attempt completion changes durable task state, duplicate or stale completions are no-ops. A valid persisted lease also prevents another worker assignment from being committed for the current attempt.
+- **At-least-once** means work may repeat so it is not silently abandoned. JetStream delivery is at-least-once until acknowledgement, and ForgeFlow task-handler execution is at-least-once across broker redelivery, configured retries, and expired-lease recovery. A worker might perform an external side effect and disappear before persisting completion; the replacement attempt can perform that effect again.
 - **Exactly-once** would require the task's external side effect and ForgeFlow's completion record to commit atomically, or require the external system to deduplicate a stable idempotency key. ForgeFlow cannot guarantee that universally and does not claim exactly-once handler execution.
 
 Stable task-run and attempt IDs let handlers implement application-level deduplication. Within ForgeFlow, identified completions are idempotent and completed logical tasks are not rescheduled. This mitigates duplicates but does not erase the crash window around external side effects.
 
-The embedded guarantee is scoped to one engine process and its atomic aggregate `Store` writes. `FileStore` is not a distributed compare-and-swap database. PostgreSQL extends the persistence boundary with transactional, version-guarded aggregate writes: competing schedulers may execute code concurrently, but only one can persist and dispatch a particular lease transition. This does not turn handlers into exactly-once operations or provide remote worker transport.
+Broker acknowledgement is deliberately last in the success path: `handler result -> persisted completion -> broker ack`. A crash before the store commit leaves the message unacknowledged and eligible for redelivery. A crash after the store commit but before the ack also causes redelivery, but persisted terminal state makes that repeat a no-op that can be acknowledged. During execution the worker path is `delivery -> persisted lease -> handler`, so delivery alone cannot bypass lease ownership. A broker delivery count never increments `TaskRun.AttemptCount`; only a successfully persisted new lease does.
 
-## Target execution flow
+The embedded guarantee is scoped to one engine process and its atomic aggregate `Store` writes. `FileStore` is not a distributed compare-and-swap database and must not back multiple processes. PostgreSQL extends the persistence boundary with transactional, version-guarded aggregate writes: competing schedulers may race, but only one can commit a particular lease transition. JetStream adds durable at-least-once transport, not an atomic transaction with PostgreSQL or a handler's external side effect.
 
-For distributed execution, the existing identified-attempt and lease model will gain narrower claim, heartbeat, and completion repository operations. Remote workers will claim attempts, heartbeat independently, invoke registered handlers, and record outcomes through a broker and the PostgreSQL-backed state authority. The current aggregate version check already provides compare-and-swap protection, while those narrower operations will avoid rewriting the complete aggregate for each remote transition.
+## Remaining distributed-runtime work
 
-The state store will be the authority for state transitions. Broker delivery alone will not prove ownership or completion. Idempotency keys and attempt identities will make redelivery safe, while atomic state transitions will prevent two workers from committing the same logical result.
+To extract workers into separately deployable processes, the existing identified-attempt and lease model will gain narrower claim, heartbeat, and completion repository operations. Remote workers will claim attempts, heartbeat independently, invoke registered handlers, and record outcomes with PostgreSQL as the state authority. The current aggregate version check already provides compare-and-swap protection, while narrower operations will avoid rewriting the complete aggregate for each remote transition.
+
+That extraction will not change the core rule already enforced today: the state store is authoritative for transitions, while broker delivery alone proves neither ownership nor completion. Idempotency keys and attempt identities mitigate redelivery; they do not create universal exactly-once execution.
 
 ## Development constraints
 
-Local development must remain viable on a machine with about 5.8 GB of RAM. The design therefore favors native Go processes, deterministic in-memory tests, and focused test doubles. Heavy broker, database, load, and orchestration tests should eventually run in CI or remote environments rather than a local multi-service stack.
+Local development must remain viable on a machine with about 5.8 GB of RAM. The design therefore favors native Go processes, deterministic in-memory tests, and focused test doubles. Normal tests require no external services. PostgreSQL and NATS integration tests run in separate GitHub Actions jobs; an already-installed standalone NATS binary is optional for developers who want to invoke the JetStream suite manually. Docker, WSL, Kafka, and a local multi-service stack are not required.
 
 Security, tenancy, authentication, and authorization are important future concerns, but they should be added when the API and deployment model make their requirements concrete.
