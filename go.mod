@@ -3,6 +3,7 @@ module github.com/vijaypratap3364/forgeflow
 go 1.26.0
 
 require (
+	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/nats-io/nats.go v1.52.0
 )

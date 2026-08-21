@@ -16,10 +16,58 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/vijaypratap3364/forgeflow/internal/execution"
+	"github.com/vijaypratap3364/forgeflow/internal/security"
 	"github.com/vijaypratap3364/forgeflow/internal/workflow"
 )
 
 const postgresTestDSNEnvironment = "FORGEFLOW_POSTGRES_TEST_DSN"
+
+func TestPostgresStoreProjectAuthorizationContract(t *testing.T) {
+	store := openIntegrationPostgresStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	admin := security.User{ID: "pg-admin", DisplayName: "Postgres Admin", CreatedAt: now}
+	project := security.Project{ID: "pg-project", Name: "Postgres Project", CreatedBy: admin.ID, CreatedAt: now, UpdatedAt: now}
+	adminRole := security.Membership{ProjectID: project.ID, UserID: admin.ID, Role: security.RoleAdmin, CreatedAt: now, UpdatedAt: now}
+	createdEvent := security.AuditEvent{ID: "pg-audit-create", ProjectID: project.ID, ActorUserID: admin.ID,
+		Action: "project.created", ResourceType: "project", ResourceID: string(project.ID), OccurredAt: now}
+	if err := store.CreateProject(ctx, admin, project, adminRole, createdEvent); err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+
+	member := security.User{ID: "pg-member", DisplayName: "Postgres Member", CreatedAt: now.Add(time.Second)}
+	membership := security.Membership{ProjectID: project.ID, UserID: member.ID, Role: security.RoleMember,
+		CreatedAt: member.CreatedAt, UpdatedAt: member.CreatedAt}
+	membershipEvent := security.AuditEvent{ID: "pg-audit-member", ProjectID: project.ID, ActorUserID: admin.ID,
+		Action: "membership.updated", ResourceType: "user", ResourceID: string(member.ID), OccurredAt: member.CreatedAt,
+		Metadata: map[string]string{"new_role": "member"}}
+	if err := store.PutMembership(ctx, member, membership, membershipEvent); err != nil {
+		t.Fatalf("PutMembership() error = %v", err)
+	}
+
+	definition := workflow.WorkflowDefinition{ID: "pg-owned-workflow", Tasks: []workflow.TaskDefinition{
+		{ID: "task", Name: "Task", Handler: "noop"},
+	}}
+	ownership := security.WorkflowOwnership{WorkflowID: definition.ID, ProjectID: project.ID,
+		OwnerUserID: member.ID, CreatedAt: now.Add(2 * time.Second)}
+	if err := store.SaveWorkflowForProject(ctx, definition, ownership); err != nil {
+		t.Fatalf("SaveWorkflowForProject() error = %v", err)
+	}
+	gotOwnership, found, err := store.LoadWorkflowOwnership(ctx, definition.ID)
+	if err != nil || !found || gotOwnership != ownership {
+		t.Fatalf("LoadWorkflowOwnership() = %#v, %v, %v; want %#v, true, nil", gotOwnership, found, err, ownership)
+	}
+	memberships, err := store.ListMemberships(ctx, project.ID)
+	if err != nil || len(memberships) != 2 {
+		t.Fatalf("ListMemberships() = %#v, error %v", memberships, err)
+	}
+	events, err := store.ListAuditEvents(ctx, project.ID, 10)
+	if err != nil || len(events) != 2 || events[0].ID != membershipEvent.ID ||
+		!reflect.DeepEqual(events[0].Metadata, membershipEvent.Metadata) {
+		t.Fatalf("ListAuditEvents() = %#v, error %v", events, err)
+	}
+}
 
 func TestPostgresStoreWorkflowAndRunContract(t *testing.T) {
 	store := openIntegrationPostgresStore(t)

@@ -90,6 +90,16 @@ func (store *PostgresStore) SaveWorkflow(ctx context.Context, definition workflo
 		return fmt.Errorf("begin save workflow definition %q: %w", definition.ID, err)
 	}
 	defer rollbackPostgresTx(ctx, tx)
+	if err := savePostgresWorkflowTx(ctx, tx, definition); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit workflow definition %q: %w", definition.ID, err)
+	}
+	return nil
+}
+
+func savePostgresWorkflowTx(ctx context.Context, tx pgx.Tx, definition workflow.WorkflowDefinition) error {
 
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO workflow_definitions (workflow_id)
@@ -106,9 +116,6 @@ func (store *PostgresStore) SaveWorkflow(ctx context.Context, definition workflo
 		}
 		if !found || !reflect.DeepEqual(existing, definition) {
 			return &execution.WorkflowConflictError{WorkflowID: definition.ID}
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("commit idempotent workflow definition %q: %w", definition.ID, err)
 		}
 		return nil
 	}
@@ -149,9 +156,6 @@ func (store *PostgresStore) SaveWorkflow(ctx context.Context, definition workflo
 				)
 			}
 		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit workflow definition %q: %w", definition.ID, err)
 	}
 	return nil
 }
