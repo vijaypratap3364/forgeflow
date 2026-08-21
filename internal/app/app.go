@@ -21,14 +21,18 @@ import (
 const (
 	defaultAddress         = "127.0.0.1:8080"
 	defaultDataPath        = "data/forgeflow.ffdb"
+	defaultStoreBackend    = "file"
 	defaultWorkerCount     = 4
 	defaultShutdownTimeout = 10 * time.Second
 )
 
-// Config contains non-secret process settings for the ForgeFlow API server.
+// Config contains process settings for the ForgeFlow API server. PostgresDSN
+// may contain credentials and must not be logged.
 type Config struct {
 	Address         string
+	StoreBackend    string
 	DataPath        string
+	PostgresDSN     string
 	WorkerCount     int
 	ShutdownTimeout time.Duration
 }
@@ -37,6 +41,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		Address:         defaultAddress,
+		StoreBackend:    defaultStoreBackend,
 		DataPath:        defaultDataPath,
 		WorkerCount:     defaultWorkerCount,
 		ShutdownTimeout: defaultShutdownTimeout,
@@ -52,6 +57,10 @@ func ConfigFromEnv() (Config, error) {
 	if value := strings.TrimSpace(os.Getenv("FORGEFLOW_DATA_PATH")); value != "" {
 		config.DataPath = value
 	}
+	if value := strings.TrimSpace(os.Getenv("FORGEFLOW_STORE")); value != "" {
+		config.StoreBackend = strings.ToLower(value)
+	}
+	config.PostgresDSN = strings.TrimSpace(os.Getenv("FORGEFLOW_POSTGRES_DSN"))
 	if value := strings.TrimSpace(os.Getenv("FORGEFLOW_WORKERS")); value != "" {
 		workerCount, err := strconv.Atoi(value)
 		if err != nil {
@@ -77,8 +86,17 @@ func (config Config) Validate() error {
 	if strings.TrimSpace(config.Address) == "" {
 		return errors.New("ForgeFlow address must not be empty")
 	}
-	if strings.TrimSpace(config.DataPath) == "" {
-		return errors.New("ForgeFlow data path must not be empty")
+	switch config.StoreBackend {
+	case "file":
+		if strings.TrimSpace(config.DataPath) == "" {
+			return errors.New("ForgeFlow data path must not be empty for the file store")
+		}
+	case "postgres":
+		if strings.TrimSpace(config.PostgresDSN) == "" {
+			return errors.New("ForgeFlow PostgreSQL data source name must not be empty for the postgres store")
+		}
+	default:
+		return fmt.Errorf("ForgeFlow store %q is unsupported: use file or postgres", config.StoreBackend)
 	}
 	if config.WorkerCount < 1 {
 		return errors.New("ForgeFlow worker count must be at least one")
@@ -101,10 +119,11 @@ func Run(ctx context.Context, config Config, output io.Writer) error {
 		return fmt.Errorf("run ForgeFlow: %w", err)
 	}
 
-	store, err := persistence.OpenFileStore(config.DataPath)
+	store, closeStore, err := openStore(ctx, config)
 	if err != nil {
 		return fmt.Errorf("run ForgeFlow: open persistence: %w", err)
 	}
+	defer closeStore()
 	registry, err := execution.NewDemoHandlerRegistry()
 	if err != nil {
 		return fmt.Errorf("run ForgeFlow: create handler registry: %w", err)
@@ -161,5 +180,25 @@ func Run(ctx context.Context, config Config, output io.Writer) error {
 			serveErr = nil
 		}
 		return errors.Join(serviceErr, httpErr, serveErr)
+	}
+}
+
+func openStore(ctx context.Context, config Config) (execution.Store, func(), error) {
+	switch config.StoreBackend {
+	case "file":
+		store, err := persistence.OpenFileStore(config.DataPath)
+		return store, func() {}, err
+	case "postgres":
+		store, err := persistence.OpenPostgresStore(ctx, config.PostgresDSN)
+		if err != nil {
+			return nil, func() {}, err
+		}
+		if err := store.Migrate(ctx); err != nil {
+			store.Close()
+			return nil, func() {}, err
+		}
+		return store, store.Close, nil
+	default:
+		return nil, func() {}, fmt.Errorf("unsupported persistence store %q", config.StoreBackend)
 	}
 }

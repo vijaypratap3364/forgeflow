@@ -77,6 +77,37 @@ func TestWorkflowRunSnapshotValidation(t *testing.T) {
 	}
 }
 
+func TestWorkflowRunSnapshotRejectsMultipleLeasesForOneWorker(t *testing.T) {
+	t.Parallel()
+
+	run := mustWorkflowRun(t, testWorkflow(testTask("a"), testTask("b")))
+	snapshot := run.Snapshot()
+	snapshot.Status = WorkflowRunRunning
+	workerID := WorkerID("worker-1")
+	for index := range snapshot.Tasks {
+		task := &snapshot.Tasks[index]
+		task.Status = TaskRunRunning
+		task.AttemptCount = 1
+		task.CurrentAttemptID = AttemptIDFor(task.TaskRunID, task.AttemptCount)
+		task.StartedAt = task.UpdatedAt
+		task.Lease = &TaskLease{
+			WorkerID:  workerID,
+			TaskRunID: task.TaskRunID,
+			AttemptID: task.CurrentAttemptID,
+			ExpiresAt: task.UpdatedAt.Add(time.Minute),
+		}
+	}
+	snapshot.Workers = []WorkerHeartbeat{{
+		WorkerID:        workerID,
+		LastHeartbeatAt: snapshot.UpdatedAt,
+	}}
+
+	var validationError *SnapshotValidationError
+	if err := snapshot.Validate(); !errors.As(err, &validationError) {
+		t.Fatalf("Validate() error = %v, want *SnapshotValidationError", err)
+	}
+}
+
 func TestRestoreWorkflowRunRejectsDefinitionMismatch(t *testing.T) {
 	t.Parallel()
 

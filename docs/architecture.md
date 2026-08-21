@@ -8,9 +8,9 @@ This document separates the components that exist today from the later distribut
 
 ## Current implementation
 
-Stage 5 contains:
+Stage 6 contains:
 
-- a Go module with no external dependencies;
+- a small dependency surface: the Go standard library plus native `pgx` for optional PostgreSQL access;
 - stable workflow and task identifier types plus in-memory definitions;
 - typed, machine-classifiable validation errors with contextual messages;
 - validation for identifiers, names, task uniqueness, dependency references, repeated edges, self-dependencies, and cycles;
@@ -23,6 +23,9 @@ Stage 5 contains:
 - a narrow persistence interface owned by the execution layer;
 - durable workflow definitions and workflow/task run snapshots with timestamps and attempt counts;
 - a standard-library append-only file journal with checksums and disk flushes;
+- a native `pgx` PostgreSQL adapter with embedded, checksummed migrations;
+- relational constraints for definitions, runs, task state, worker heartbeats, and leases;
+- optimistic run versions that reject stale cross-process aggregate writes;
 - restart recovery that preserves succeeded tasks and reschedules unfinished work;
 - per-task retry policies with explicit transient-error classification and capped exponential backoff;
 - stable task-run and attempt identities with duplicate/stale completion rejection;
@@ -36,7 +39,7 @@ Stage 5 contains:
 - liveness, readiness, configurable process settings, and graceful shutdown;
 - handler tests built with `httptest` plus deterministic domain and engine tests.
 
-There is currently no remote worker, messaging system, authentication, cross-process recovery controller, PostgreSQL adapter, metrics/tracing stack, or browser UI. The executable runs the local HTTP service and its embedded store without a second process.
+There is currently no remote worker, messaging system, authentication, automatic cross-process recovery controller, metrics/tracing stack, or browser UI. The executable runs the local HTTP service with the embedded store by default and can instead connect to PostgreSQL when explicitly configured.
 
 ## Eventual component boundaries
 
@@ -46,13 +49,13 @@ There is currently no remote worker, messaging system, authentication, cross-pro
 | Scheduler | Identify, lease, retry, and dispatch ready tasks without violating dependencies | Current, in process |
 | Dispatcher | Offer runnable tasks to workers through a queue | Current, in-memory only |
 | Worker runtime | Execute registered handlers, heartbeat, and report identified attempt outcomes | Current, in process |
-| State store | Persist definitions, attempts, leases, heartbeats, and aggregate run state | Current, embedded single-process journal |
+| State store | Persist definitions, attempts, leases, heartbeats, and aggregate run state | Current, embedded journal or PostgreSQL |
 | Messaging boundary | Decouple dispatch and execution through a broker adapter | Future |
 | Recovery controller | Detect expired leases and make abandoned work eligible again | Current in scheduler; distributed controller future |
 | API | Accept workflows; create, inspect, stream, and cancel runs | Current, HTTP/JSON and SSE |
 | Observability | Provide structured logs, metrics, traces, and operational diagnostics | Future |
 
-Messaging will receive a narrow interface when that boundary becomes real. PostgreSQL and a production message broker should arrive only after their multi-process semantics are understood and covered by contract tests.
+Messaging will receive a narrow interface when that boundary becomes real. The PostgreSQL implementation remains behind the existing Store interface; a production message broker will arrive only after its multi-process semantics are understood and covered by contract tests.
 
 ## Current graph algorithms
 
@@ -74,7 +77,9 @@ HTTP client ---- JSON/SSE ---- API + run manager
                        + job  |     |     v              |
                               | heartbeats/results  execution.Store
                               v     |                    |
-                         identified workers        FileStore journal
+                         identified workers        Store boundary
+                                                  /            \
+                                          FileStore         PostgreSQL
 ```
 
 `Engine.Execute` creates an isolated `WorkflowRun`, resolves every handler before accepting the run, saves its immutable definition and initial snapshot, derives a run context from the caller, and starts the configured number of workers. Each `Execute` call owns its queue and worker goroutines, so the same engine can execute multiple workflow runs concurrently without sharing mutable run state.
@@ -95,15 +100,32 @@ The `internal/api` package keeps JSON request and response types separate from w
 
 Run and task GET endpoints read the latest snapshot from `execution.Store`, rather than relying on an API-only cache. The event stream is also downstream of persistence: a small Store decorator observes only successful `CreateRun` and `SaveRun` calls, compares consecutive snapshots, and publishes typed SSE transitions. Its append-only in-memory event history supports `Last-Event-ID` replay for the lifetime of the current process without turning the local journal into an event-sourcing API. After a restart, durable status remains authoritative, but the previous process's SSE history is not reconstructed.
 
-`/healthz` reports process liveness. `/readyz` reports whether the server is accepting work and changes to unavailable during shutdown; it is not yet a remote dependency probe because the embedded Store has no external service. On SIGINT or SIGTERM the process stops accepting HTTP connections, cancels active runs, waits for engine goroutines within a configurable deadline, closes SSE streams, and completes `http.Server.Shutdown`.
+`/healthz` reports process liveness. `/readyz` reports whether the server is accepting work and changes to unavailable during shutdown. PostgreSQL is pinged and migrated before the listener starts when that backend is selected, but readiness is not yet a continuous dependency probe. On SIGINT or SIGTERM the process stops accepting HTTP connections, cancels active runs, waits for engine goroutines within a configurable deadline, closes SSE streams, and completes `http.Server.Shutdown`.
 
-## Persistence boundary and local backend
+## Persistence boundary and storage backends
 
-The execution package owns the `Store` interface because the scheduler is its consumer. The boundary provides idempotent immutable-definition storage, create-versus-update run operations, and lookup of definitions and run snapshots. The scheduler has no dependency on the file-store package or its encoding.
+The execution package owns the `Store` interface because the scheduler is its consumer. The boundary provides idempotent immutable-definition storage, create-versus-update run operations, and lookup of definitions and run snapshots. `CreateRun` turns an unpersisted version-zero aggregate into version one. `SaveRun` treats its supplied version as an optimistic concurrency expectation and returns the next committed version. The scheduler has no dependency on either backend or its encoding.
 
 `FileStore` is a single-process embedded implementation. A mutation is one checksummed journal envelope containing the complete changed aggregate. The file is opened in append mode, written fully, and synced before the in-memory index changes. Reopening replays records in order. A partial tail without the terminating newline is treated as an uncommitted write and truncated; malformed or checksum-invalid committed records stop startup with an error. This provides atomic aggregate changes for the current single-writer process without a database service. It deliberately has no compaction, concurrent-process writer coordination, or query indexes yet.
 
-The backend uses only Go's standard library. SQLite was not selected because this stage does not need relational queries or concurrent transactions, and avoiding both CGO/native DLL requirements and a new pure-Go driver keeps the Windows development setup small. PostgreSQL can later implement the same boundary when distributed ownership requires server-side transactions.
+The local backend uses only Go's standard library. SQLite was not selected because local development does not need relational queries or concurrent transactions, and avoiding both CGO/native DLL requirements and a SQLite driver keeps the Windows setup small. PostgreSQL is optional: the application uses the journal unless `FORGEFLOW_STORE=postgres` is selected, and ordinary tests do not connect to a database.
+
+### PostgreSQL schema and transactions
+
+The PostgreSQL adapter uses native, pure-Go `pgx` and a bounded connection pool. Embedded up-migrations are applied explicitly at application startup. A migration ledger stores each filename and SHA-256 checksum; a PostgreSQL advisory transaction lock serializes concurrent migrators and a changed checksum stops startup instead of silently accepting schema drift.
+
+The relational model uses these ownership boundaries:
+
+- `workflow_definitions` owns ordered `task_definitions`; ordered `task_dependencies` has foreign keys to both the dependent and dependency tasks.
+- `workflow_runs` references one immutable definition and owns `task_runs` plus `workers`.
+- `task_leases` references the task run, its deterministic task-run ID, and the worker heartbeat row. Unique `(run_id, attempt_id)` and `(run_id, worker_id)` constraints prevent duplicate attempt records and more than one active task per in-process worker identity.
+- status, identifier, attempt-count, retry-deadline, terminal-timestamp, and lease relationships are guarded by checks or foreign keys where the database can enforce them. The richer aggregate invariants are also validated by the Go domain model before writes and after reads.
+
+Saving a workflow inserts its definition, ordered tasks, and dependencies in one transaction. Existing identical definitions are idempotent; differing content under the same workflow ID is rejected. Creating a run inserts the parent, all task rows, heartbeat rows, and leases in one transaction. Updating a run first executes a conditional `UPDATE workflow_runs ... WHERE run_id = ? AND version = ?`, incrementing the version only for the winner. Every task, worker, and lease change then commits in that same transaction. A stale scheduler therefore cannot publish its lease or completion state, and no job is dispatched until the winning lease snapshot has persisted. Run reads use a read-only repeatable-read transaction so parent, task, worker, and lease rows come from one consistent database snapshot.
+
+Indexes follow current operations rather than hypothetical reporting queries. Primary and unique indexes start with the aggregate lookup keys used today: workflow ID; `(workflow_id, task_id)` and ordered task/dependency positions; run ID; `(run_id, task_id)` and `(run_id, task_run_id)`; `(run_id, worker_id)`; and lease attempt/worker identities. No speculative status or timestamp indexes are added because the current Store has no collection scans or recovery polling query. Those indexes should accompany such queries when that API is introduced.
+
+PostgreSQL integration tests carry the `integration` build tag and isolate themselves in temporary schemas. GitHub Actions supplies a disposable PostgreSQL service and runs those tests with the race detector. This verifies migrations, relational constraints/indexes, definition and run round trips, persisted live leases, completion, and concurrent version conflicts without requiring a local PostgreSQL installation.
 
 ## Leases, heartbeats, and restart behavior
 
@@ -121,11 +143,11 @@ If a local worker disappears, its heartbeat stops and its slot is supervised wit
 
 Stable task-run and attempt IDs let handlers implement application-level deduplication. Within ForgeFlow, identified completions are idempotent and completed logical tasks are not rescheduled. This mitigates duplicates but does not erase the crash window around external side effects.
 
-The current guarantee is scoped to one engine process and its atomic aggregate `Store` writes. `FileStore` is not a distributed compare-and-swap database. PostgreSQL will later implement the same persistence boundary with transactional lease acquisition for multiple scheduler and worker processes.
+The embedded guarantee is scoped to one engine process and its atomic aggregate `Store` writes. `FileStore` is not a distributed compare-and-swap database. PostgreSQL extends the persistence boundary with transactional, version-guarded aggregate writes: competing schedulers may execute code concurrently, but only one can persist and dispatch a particular lease transition. This does not turn handlers into exactly-once operations or provide remote worker transport.
 
 ## Target execution flow
 
-For distributed execution, the existing identified-attempt and lease model will move behind transactional storage operations. Remote workers will claim attempts, heartbeat independently, invoke registered handlers, and record outcomes through a broker and PostgreSQL-backed state authority. Lease acquisition and completion will need compare-and-swap semantics across processes.
+For distributed execution, the existing identified-attempt and lease model will gain narrower claim, heartbeat, and completion repository operations. Remote workers will claim attempts, heartbeat independently, invoke registered handlers, and record outcomes through a broker and the PostgreSQL-backed state authority. The current aggregate version check already provides compare-and-swap protection, while those narrower operations will avoid rewriting the complete aggregate for each remote transition.
 
 The state store will be the authority for state transitions. Broker delivery alone will not prove ownership or completion. Idempotency keys and attempt identities will make redelivery safe, while atomic state transitions will prevent two workers from committing the same logical result.
 

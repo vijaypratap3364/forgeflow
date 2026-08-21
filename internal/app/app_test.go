@@ -11,7 +11,9 @@ import (
 
 func TestConfigFromEnv(t *testing.T) {
 	t.Setenv("FORGEFLOW_ADDR", "127.0.0.1:9090")
+	t.Setenv("FORGEFLOW_STORE", "postgres")
 	t.Setenv("FORGEFLOW_DATA_PATH", "custom.ffdb")
+	t.Setenv("FORGEFLOW_POSTGRES_DSN", "postgres://forgeflow.example/forgeflow")
 	t.Setenv("FORGEFLOW_WORKERS", "2")
 	t.Setenv("FORGEFLOW_SHUTDOWN_TIMEOUT", "3s")
 
@@ -19,9 +21,48 @@ func TestConfigFromEnv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ConfigFromEnv() error = %v", err)
 	}
-	if config.Address != "127.0.0.1:9090" || config.DataPath != "custom.ffdb" ||
+	if config.Address != "127.0.0.1:9090" || config.StoreBackend != "postgres" ||
+		config.DataPath != "custom.ffdb" || config.PostgresDSN != "postgres://forgeflow.example/forgeflow" ||
 		config.WorkerCount != 2 || config.ShutdownTimeout != 3*time.Second {
 		t.Fatalf("ConfigFromEnv() = %#v", config)
+	}
+}
+
+func TestConfigValidateStoreRequirements(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{
+			name: "unknown backend",
+			mutate: func(config *Config) {
+				config.StoreBackend = "sqlite"
+			},
+		},
+		{
+			name: "file path missing",
+			mutate: func(config *Config) {
+				config.DataPath = ""
+			},
+		},
+		{
+			name: "PostgreSQL DSN missing",
+			mutate: func(config *Config) {
+				config.StoreBackend = "postgres"
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			config := DefaultConfig()
+			test.mutate(&config)
+			if err := config.Validate(); err == nil {
+				t.Fatal("Config.Validate() error = nil")
+			}
+		})
 	}
 }
 

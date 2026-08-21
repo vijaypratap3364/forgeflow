@@ -8,17 +8,17 @@ Reliable workflow execution is more than running functions in order. A useful en
 
 ## Current status
 
-**Stage 5: API-driven local workflow execution.** ForgeFlow now provides validated workflow definitions, explicit workflow/task run state machines, a scheduler, a safe task-handler registry, configurable concurrent workers, durable local persistence, retry policy with exponential backoff, identified task attempts, worker heartbeats, expiring task leases, and a versioned REST API with live Server-Sent Events (SSE).
+**Stage 6: optional production PostgreSQL persistence.** ForgeFlow now provides validated workflow definitions, explicit workflow/task run state machines, a scheduler, a safe task-handler registry, configurable concurrent workers, retry policy with exponential backoff, identified task attempts, worker heartbeats, expiring task leases, a versioned REST API with live Server-Sent Events (SSE), and interchangeable embedded-file and PostgreSQL stores.
 
-Independent tasks run concurrently, successful dependencies unlock downstream work, and terminal task failure or context cancellation stops unfinished work consistently. Marked transient failures retry within policy using testable exponential backoff. Every dispatch has a stable task-run ID and attempt ID; only the worker holding that attempt's valid lease can commit its result. Heartbeats renew active leases, while expired leases make abandoned work retryable without rerunning already completed tasks. The standard-library HTTP server now accepts definitions, starts and cancels asynchronous runs, exposes durable run/task status, and streams persisted transitions. Remote workers, brokers, PostgreSQL, authentication, and deployment infrastructure have not been implemented. See [the roadmap](docs/roadmap.md) for the planned progression and [the architecture notes](docs/architecture.md) for the reliability and delivery guarantees.
+Independent tasks run concurrently, successful dependencies unlock downstream work, and terminal task failure or context cancellation stops unfinished work consistently. Marked transient failures retry within policy using testable exponential backoff. Every dispatch has a stable task-run ID and attempt ID; only the worker holding that attempt's valid lease can commit its result. Heartbeats renew active leases, while expired leases make abandoned work retryable without rerunning already completed tasks. The standard-library HTTP server accepts definitions, starts and cancels asynchronous runs, exposes durable run/task status, and streams persisted transitions. The PostgreSQL adapter makes aggregate changes transactional and rejects stale concurrent writers. Remote workers, brokers, authentication, and deployment infrastructure have not been implemented. See [the roadmap](docs/roadmap.md) for the planned progression and [the architecture notes](docs/architecture.md) for the reliability and delivery guarantees.
 
 ## Local development
 
-Local development is intentionally lightweight because the primary development machine has limited memory. ForgeFlow uses the native Go toolchain and the standard library at this stage. It does not require Docker Desktop, WSL, Kubernetes, Kafka, a database service, or any background process.
+Local development is intentionally lightweight because the primary development machine has limited memory. ForgeFlow uses the native Go toolchain and keeps the embedded file backend as its default. It does not require Docker Desktop, WSL, Kubernetes, Kafka, a database service, or any background process. The pure-Go `pgx` dependency compiles the optional PostgreSQL adapter without installing PostgreSQL locally.
 
 The embedded `FileStore` uses a configurable path and an append-only, checksummed JSON journal. Each mutation writes one complete aggregate snapshot, flushes it to disk, and only then exposes it in memory. On startup, complete records are replayed and an incomplete final record is truncated. Tests use isolated temporary directories, and `*.ffdb` files are ignored by Git.
 
-This backend was chosen instead of SQLite because the current access pattern needs only a single-process durable aggregate log. It adds no CGO toolchain, native DLL, pure-Go SQLite dependency, daemon, or container overhead. The scheduler depends only on the `execution.Store` interface, so a transactional PostgreSQL adapter can replace the journal when later stages require multi-process coordination and richer queries.
+This backend was chosen instead of SQLite because the local access pattern needs only a single-process durable aggregate log. It adds no CGO toolchain, native DLL, SQLite driver, daemon, or container overhead. The scheduler depends only on the `execution.Store` interface. Set `FORGEFLOW_STORE=postgres` and supply `FORGEFLOW_POSTGRES_DSN` to select the production adapter; startup verifies the pool and applies the embedded migrations. PostgreSQL integration tests run against an ephemeral service in GitHub Actions and are excluded from ordinary local tests.
 
 ## Current reliability guarantee
 
@@ -41,7 +41,9 @@ The server listens on `127.0.0.1:8080` and writes its embedded journal to `data/
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `FORGEFLOW_ADDR` | `127.0.0.1:8080` | HTTP listen address and port |
+| `FORGEFLOW_STORE` | `file` | Persistence backend: `file` or `postgres` |
 | `FORGEFLOW_DATA_PATH` | `data/forgeflow.ffdb` | Append-only journal path |
+| `FORGEFLOW_POSTGRES_DSN` | empty | PostgreSQL connection string; required only for the `postgres` backend |
 | `FORGEFLOW_WORKERS` | `4` | Worker goroutines per active run |
 | `FORGEFLOW_SHUTDOWN_TIMEOUT` | `10s` | Graceful-shutdown deadline |
 
@@ -92,7 +94,7 @@ cmd/forgeflow/      executable entry point
 internal/app/       bootstrap application behavior
 internal/api/       versioned HTTP API, async run lifecycle, and SSE events
 internal/execution/ run state, scheduler, handlers, and workers
-internal/persistence/ embedded durable Store implementation
+internal/persistence/ embedded and PostgreSQL Store implementations and migrations
 internal/workflow/  workflow definitions and DAG semantics
 docs/               architecture and delivery roadmap
 ```

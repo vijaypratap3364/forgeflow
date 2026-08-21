@@ -112,6 +112,15 @@ func (snapshot WorkflowRunSnapshot) Validate() error {
 				task.Lease.AttemptID != task.CurrentAttemptID || task.Lease.ExpiresAt.IsZero() {
 				return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("task %q has an invalid lease", task.TaskID)}
 			}
+			if _, exists := leasedWorkers[task.Lease.WorkerID]; exists {
+				return &SnapshotValidationError{
+					RunID: snapshot.ID,
+					Reason: fmt.Sprintf(
+						"worker %q holds more than one active task lease",
+						task.Lease.WorkerID,
+					),
+				}
+			}
 			leasedWorkers[task.Lease.WorkerID] = struct{}{}
 		}
 		statusCounts[task.Status]++
