@@ -14,6 +14,10 @@ func TestConfigFromEnv(t *testing.T) {
 	t.Setenv("FORGEFLOW_STORE", "postgres")
 	t.Setenv("FORGEFLOW_DATA_PATH", "custom.ffdb")
 	t.Setenv("FORGEFLOW_POSTGRES_DSN", "postgres://forgeflow.example/forgeflow")
+	t.Setenv("FORGEFLOW_BROKER", "nats")
+	t.Setenv("FORGEFLOW_NATS_URL", "nats://forgeflow.example:4222")
+	t.Setenv("FORGEFLOW_NATS_STREAM", "FORGEFLOW_TEST_TASKS")
+	t.Setenv("FORGEFLOW_NATS_SUBJECT_PREFIX", "forgeflow.test.tasks")
 	t.Setenv("FORGEFLOW_WORKERS", "2")
 	t.Setenv("FORGEFLOW_SHUTDOWN_TIMEOUT", "3s")
 
@@ -23,6 +27,8 @@ func TestConfigFromEnv(t *testing.T) {
 	}
 	if config.Address != "127.0.0.1:9090" || config.StoreBackend != "postgres" ||
 		config.DataPath != "custom.ffdb" || config.PostgresDSN != "postgres://forgeflow.example/forgeflow" ||
+		config.BrokerBackend != "nats" || config.NATSURL != "nats://forgeflow.example:4222" ||
+		config.NATSStreamName != "FORGEFLOW_TEST_TASKS" || config.NATSSubjectPrefix != "forgeflow.test.tasks" ||
 		config.WorkerCount != 2 || config.ShutdownTimeout != 3*time.Second {
 		t.Fatalf("ConfigFromEnv() = %#v", config)
 	}
@@ -51,6 +57,19 @@ func TestConfigValidateStoreRequirements(t *testing.T) {
 			name: "PostgreSQL DSN missing",
 			mutate: func(config *Config) {
 				config.StoreBackend = "postgres"
+			},
+		},
+		{
+			name: "unknown broker",
+			mutate: func(config *Config) {
+				config.BrokerBackend = "kafka"
+			},
+		},
+		{
+			name: "invalid NATS stream",
+			mutate: func(config *Config) {
+				config.BrokerBackend = "nats"
+				config.NATSStreamName = "forgeflow.tasks"
 			},
 		},
 	}

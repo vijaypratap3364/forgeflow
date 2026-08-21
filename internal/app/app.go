@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/vijaypratap3364/forgeflow/internal/api"
+	"github.com/vijaypratap3364/forgeflow/internal/broker"
 	"github.com/vijaypratap3364/forgeflow/internal/execution"
 	"github.com/vijaypratap3364/forgeflow/internal/persistence"
 )
@@ -22,29 +23,39 @@ const (
 	defaultAddress         = "127.0.0.1:8080"
 	defaultDataPath        = "data/forgeflow.ffdb"
 	defaultStoreBackend    = "file"
+	defaultBrokerBackend   = "memory"
 	defaultWorkerCount     = 4
 	defaultShutdownTimeout = 10 * time.Second
 )
 
 // Config contains process settings for the ForgeFlow API server. PostgresDSN
-// may contain credentials and must not be logged.
+// and NATSURL may contain credentials and must not be logged.
 type Config struct {
-	Address         string
-	StoreBackend    string
-	DataPath        string
-	PostgresDSN     string
-	WorkerCount     int
-	ShutdownTimeout time.Duration
+	Address           string
+	StoreBackend      string
+	DataPath          string
+	PostgresDSN       string
+	BrokerBackend     string
+	NATSURL           string
+	NATSStreamName    string
+	NATSSubjectPrefix string
+	WorkerCount       int
+	ShutdownTimeout   time.Duration
 }
 
 // DefaultConfig returns laptop-friendly local process defaults.
 func DefaultConfig() Config {
+	natsConfig := broker.DefaultNATSConfig()
 	return Config{
-		Address:         defaultAddress,
-		StoreBackend:    defaultStoreBackend,
-		DataPath:        defaultDataPath,
-		WorkerCount:     defaultWorkerCount,
-		ShutdownTimeout: defaultShutdownTimeout,
+		Address:           defaultAddress,
+		StoreBackend:      defaultStoreBackend,
+		DataPath:          defaultDataPath,
+		BrokerBackend:     defaultBrokerBackend,
+		NATSURL:           natsConfig.URL,
+		NATSStreamName:    natsConfig.StreamName,
+		NATSSubjectPrefix: natsConfig.SubjectPrefix,
+		WorkerCount:       defaultWorkerCount,
+		ShutdownTimeout:   defaultShutdownTimeout,
 	}
 }
 
@@ -61,6 +72,18 @@ func ConfigFromEnv() (Config, error) {
 		config.StoreBackend = strings.ToLower(value)
 	}
 	config.PostgresDSN = strings.TrimSpace(os.Getenv("FORGEFLOW_POSTGRES_DSN"))
+	if value := strings.TrimSpace(os.Getenv("FORGEFLOW_BROKER")); value != "" {
+		config.BrokerBackend = strings.ToLower(value)
+	}
+	if value := strings.TrimSpace(os.Getenv("FORGEFLOW_NATS_URL")); value != "" {
+		config.NATSURL = value
+	}
+	if value := strings.TrimSpace(os.Getenv("FORGEFLOW_NATS_STREAM")); value != "" {
+		config.NATSStreamName = value
+	}
+	if value := strings.TrimSpace(os.Getenv("FORGEFLOW_NATS_SUBJECT_PREFIX")); value != "" {
+		config.NATSSubjectPrefix = value
+	}
 	if value := strings.TrimSpace(os.Getenv("FORGEFLOW_WORKERS")); value != "" {
 		workerCount, err := strconv.Atoi(value)
 		if err != nil {
@@ -98,6 +121,19 @@ func (config Config) Validate() error {
 	default:
 		return fmt.Errorf("ForgeFlow store %q is unsupported: use file or postgres", config.StoreBackend)
 	}
+	switch config.BrokerBackend {
+	case "memory":
+	case "nats":
+		natsConfig := broker.DefaultNATSConfig()
+		natsConfig.URL = config.NATSURL
+		natsConfig.StreamName = config.NATSStreamName
+		natsConfig.SubjectPrefix = config.NATSSubjectPrefix
+		if err := natsConfig.Validate(); err != nil {
+			return fmt.Errorf("ForgeFlow NATS configuration: %w", err)
+		}
+	default:
+		return fmt.Errorf("ForgeFlow broker %q is unsupported: use memory or nats", config.BrokerBackend)
+	}
 	if config.WorkerCount < 1 {
 		return errors.New("ForgeFlow worker count must be at least one")
 	}
@@ -124,11 +160,21 @@ func Run(ctx context.Context, config Config, output io.Writer) error {
 		return fmt.Errorf("run ForgeFlow: open persistence: %w", err)
 	}
 	defer closeStore()
+	taskBroker, closeBroker, err := openBroker(ctx, config)
+	if err != nil {
+		return fmt.Errorf("run ForgeFlow: open task broker: %w", err)
+	}
+	defer closeBroker()
 	registry, err := execution.NewDemoHandlerRegistry()
 	if err != nil {
 		return fmt.Errorf("run ForgeFlow: create handler registry: %w", err)
 	}
-	apiServer, err := api.NewServer(store, registry, config.WorkerCount)
+	apiServer, err := api.NewServer(
+		store,
+		registry,
+		config.WorkerCount,
+		execution.WithBroker(taskBroker),
+	)
 	if err != nil {
 		return fmt.Errorf("run ForgeFlow: create API server: %w", err)
 	}
@@ -180,6 +226,26 @@ func Run(ctx context.Context, config Config, output io.Writer) error {
 			serveErr = nil
 		}
 		return errors.Join(serviceErr, httpErr, serveErr)
+	}
+}
+
+func openBroker(ctx context.Context, config Config) (broker.Broker, func(), error) {
+	switch config.BrokerBackend {
+	case "memory":
+		taskBroker := broker.NewInMemoryBroker()
+		return taskBroker, func() { _ = taskBroker.Close() }, nil
+	case "nats":
+		natsConfig := broker.DefaultNATSConfig()
+		natsConfig.URL = config.NATSURL
+		natsConfig.StreamName = config.NATSStreamName
+		natsConfig.SubjectPrefix = config.NATSSubjectPrefix
+		taskBroker, err := broker.OpenNATSBroker(ctx, natsConfig)
+		if err != nil {
+			return nil, func() {}, err
+		}
+		return taskBroker, func() { _ = taskBroker.Close() }, nil
+	default:
+		return nil, func() {}, fmt.Errorf("unsupported task broker %q", config.BrokerBackend)
 	}
 }
 
