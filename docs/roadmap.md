@@ -44,14 +44,18 @@ Keep this stage in memory and independent of workers, databases, brokers, and HT
 
 The current implementation proves these semantics with identified in-process workers and the embedded Store. Cross-process claims and heartbeats remain part of the later PostgreSQL and remote-worker stages.
 
-## Stage 5 — API and production storage (next)
+## Stage 5 — REST API and live workflow status (complete)
 
 - Add an HTTP API for workflow submission, inspection, and cancellation.
 - Define validation, error, pagination, and concurrency behavior before optimizing transport.
+- Stream persisted workflow and task transitions with Server-Sent Events.
+- Add health/readiness probes, environment configuration, examples, and graceful shutdown.
+
+The current API addresses individual resources by stable ID; collection listing and pagination will be added when the Store gains query operations. SSE replay is intentionally process-local, while current run status remains durable in the Store.
+
+## Stage 6 — Production storage, distributed messaging, and workers
+
 - Add PostgreSQL behind the existing Store boundary when multi-process transactional requirements justify it.
-
-## Stage 6 — Distributed messaging and workers
-
 - Introduce a broker interface and a production-grade broker adapter.
 - Run workers as separate processes and make delivery/redelivery behavior explicit.
 - Add integration and failure-injection tests in CI or remote infrastructure.

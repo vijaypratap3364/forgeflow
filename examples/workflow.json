@@ -1,0 +1,22 @@
+{
+  "id": "forge-demo",
+  "tasks": [
+    {
+      "id": "prepare",
+      "name": "Prepare workflow",
+      "handler": "noop"
+    },
+    {
+      "id": "transform",
+      "name": "Transform text",
+      "dependencies": ["prepare"],
+      "handler": "uppercase",
+      "input": "forgeflow is running",
+      "retry": {
+        "max_attempts": 3,
+        "initial_backoff": "100ms",
+        "max_backoff": "1s"
+      }
+    }
+  ]
+}

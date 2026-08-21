@@ -8,7 +8,7 @@ This document separates the components that exist today from the later distribut
 
 ## Current implementation
 
-Stage 4 contains:
+Stage 5 contains:
 
 - a Go module with no external dependencies;
 - stable workflow and task identifier types plus in-memory definitions;
@@ -29,9 +29,14 @@ Stage 4 contains:
 - persisted task leases assigned to identified workers;
 - persisted worker heartbeats that renew live leases;
 - lease-expiry recovery and supervised replacement of disappeared local workers;
-- a small bootstrap command with deterministic unit tests.
+- a versioned JSON REST API built on Go's standard `net/http` stack;
+- asynchronous API-managed run execution and cancellation;
+- durable aggregate and task-level status reads;
+- replayable live Server-Sent Events derived from persisted transitions;
+- liveness, readiness, configurable process settings, and graceful shutdown;
+- handler tests built with `httptest` plus deterministic domain and engine tests.
 
-There is currently no remote worker, messaging system, HTTP API, authentication, cross-process recovery controller, or observability stack. The executable remains a bootstrap status command; workflow execution and recovery are currently exposed as internal Go APIs and exercised through tests.
+There is currently no remote worker, messaging system, authentication, cross-process recovery controller, PostgreSQL adapter, metrics/tracing stack, or browser UI. The executable runs the local HTTP service and its embedded store without a second process.
 
 ## Eventual component boundaries
 
@@ -44,7 +49,7 @@ There is currently no remote worker, messaging system, HTTP API, authentication,
 | State store | Persist definitions, attempts, leases, heartbeats, and aggregate run state | Current, embedded single-process journal |
 | Messaging boundary | Decouple dispatch and execution through a broker adapter | Future |
 | Recovery controller | Detect expired leases and make abandoned work eligible again | Current in scheduler; distributed controller future |
-| API | Accept workflows and expose execution state | Future |
+| API | Accept workflows; create, inspect, stream, and cancel runs | Current, HTTP/JSON and SSE |
 | Observability | Provide structured logs, metrics, traces, and operational diagnostics | Future |
 
 Messaging will receive a narrow interface when that boundary becomes real. PostgreSQL and a production message broker should arrive only after their multi-process semantics are understood and covered by contract tests.
@@ -58,16 +63,18 @@ Topological ordering uses Kahn's algorithm. A min-heap of zero-indegree task IDs
 ## Current execution architecture
 
 ```text
-WorkflowDefinition + RunID
-            |
-            v
-       Scheduler loop <-------- recovered snapshot
-        |     ^     |                    ^
- lease  |     |     | persist            |
- + job  |     |     v                    |
-        |  heartbeats/results       execution.Store
-        v     |                          |
-   identified workers              FileStore journal
+HTTP client ---- JSON/SSE ---- API + run manager
+                                  |
+                    persist pending run, then recover
+                                  |
+                                  v
+                             Scheduler loop <------- snapshot
+                              |     ^     |              ^
+                       lease  |     |     | persist      |
+                       + job  |     |     v              |
+                              | heartbeats/results  execution.Store
+                              v     |                    |
+                         identified workers        FileStore journal
 ```
 
 `Engine.Execute` creates an isolated `WorkflowRun`, resolves every handler before accepting the run, saves its immutable definition and initial snapshot, derives a run context from the caller, and starts the configured number of workers. Each `Execute` call owns its queue and worker goroutines, so the same engine can execute multiple workflow runs concurrently without sharing mutable run state.
@@ -79,6 +86,16 @@ Task transitions are `pending -> ready -> running -> succeeded|retry_wait|failed
 Unmarked handler errors are terminal. A marked `RetryableTaskError` schedules another attempt only while `AttemptCount < MaxAttempts`; a zero maximum preserves the default of one total attempt. Delay starts at `InitialBackoff`, doubles after each completed attempt, and is capped by `MaxBackoff` when configured. Exhaustion or a terminal error invokes the fail-fast policy: unfinished tasks are canceled and the workflow fails. Handlers receive `context.Context` and are required to return promptly when it is canceled; Go cannot forcibly stop a handler that ignores its context.
 
 The engine clock and timers are interfaces. Production uses the standard library clock, while tests advance controlled time to prove backoff, heartbeat, and expiry behavior without real sleeps.
+
+## HTTP API and process lifecycle
+
+The `internal/api` package keeps JSON request and response types separate from workflow and execution aggregates. Requests use strict JSON decoding, reject unknown fields and bodies larger than 1 MiB, and translate typed domain errors into stable error envelopes with useful HTTP status codes. Go duration strings such as `100ms` and `2s` are parsed only at the transport boundary.
+
+`POST /api/v1/workflows/{id}/runs` validates handler availability and durably creates a pending run before returning `202 Accepted`. A server-owned run manager then calls `Engine.Recover` in a goroutine. The accepted run is deliberately independent of the request context after persistence, so closing the creation request does not cancel submitted work. The explicit cancellation endpoint cancels that server-owned run context; handlers receive the cancellation through the existing engine contract.
+
+Run and task GET endpoints read the latest snapshot from `execution.Store`, rather than relying on an API-only cache. The event stream is also downstream of persistence: a small Store decorator observes only successful `CreateRun` and `SaveRun` calls, compares consecutive snapshots, and publishes typed SSE transitions. Its append-only in-memory event history supports `Last-Event-ID` replay for the lifetime of the current process without turning the local journal into an event-sourcing API. After a restart, durable status remains authoritative, but the previous process's SSE history is not reconstructed.
+
+`/healthz` reports process liveness. `/readyz` reports whether the server is accepting work and changes to unavailable during shutdown; it is not yet a remote dependency probe because the embedded Store has no external service. On SIGINT or SIGTERM the process stops accepting HTTP connections, cancels active runs, waits for engine goroutines within a configurable deadline, closes SSE streams, and completes `http.Server.Shutdown`.
 
 ## Persistence boundary and local backend
 
