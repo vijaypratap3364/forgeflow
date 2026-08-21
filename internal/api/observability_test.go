@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/vijaypratap3364/forgeflow/internal/execution"
 	"github.com/vijaypratap3364/forgeflow/internal/observability"
@@ -57,6 +58,7 @@ func TestMetricsAndStructuredLogsDescribeWorkflowExecution(t *testing.T) {
 		t.Fatal("run creation response is missing X-Request-ID")
 	}
 	waitForEventStream(t, server, "observed-run")
+	waitForObservedRuns(t, server)
 
 	metricsResponse := request(t, server, http.MethodGet, "/metrics", "", "")
 	assertStatus(t, metricsResponse, http.StatusOK)
@@ -183,6 +185,7 @@ func TestRetryInstrumentationCountsFailedAndSuccessfulAttempts(t *testing.T) {
 	)
 	assertStatus(t, created, http.StatusAccepted)
 	waitForEventStream(t, server, "retry-metrics-run")
+	waitForObservedRuns(t, server)
 
 	metricsResponse := request(t, server, http.MethodGet, "/metrics", "", "")
 	metrics := metricsResponse.Body.String()
@@ -236,6 +239,7 @@ func TestTraceContextConnectsHTTPToSchedulerBrokerWorkerAndPersistence(t *testin
 	server.ServeHTTP(createResponse, createRequest)
 	assertStatus(t, createResponse, http.StatusAccepted)
 	waitForEventStream(t, server, "traced-run")
+	waitForObservedRuns(t, server)
 
 	wantTraceID, err := trace.TraceIDFromHex("4bf92f3577b34da6a3ce929d0e0e4736")
 	if err != nil {
@@ -325,6 +329,20 @@ func spanNames(spans map[string]tracetest.SpanStub) []string {
 		names = append(names, name)
 	}
 	return names
+}
+
+func waitForObservedRuns(t *testing.T, server *Server) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		server.manager.workers.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for workflow instrumentation to complete")
+	}
 }
 
 type lockedBuffer struct {
