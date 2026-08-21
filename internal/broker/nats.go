@@ -224,6 +224,17 @@ func (b *NATSBroker) Receive(ctx context.Context, subscription Subscription) (De
 
 	message, err := consumer.Next(jetstream.FetchContext(ctx))
 	if err != nil {
+		if contextErr := ctx.Err(); contextErr != nil {
+			return nil, contextErr
+		}
+		// JetStream expires a pull request shortly before the supplied context
+		// deadline so its server response has time to arrive. Present that
+		// implementation detail as the caller's transport deadline.
+		if errors.Is(err, nats.ErrTimeout) {
+			if _, hasDeadline := ctx.Deadline(); hasDeadline {
+				return nil, context.DeadlineExceeded
+			}
+		}
 		return nil, fmt.Errorf("receive task message: %w", err)
 	}
 	metadata, err := message.Metadata()
