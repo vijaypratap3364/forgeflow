@@ -77,3 +77,25 @@ func TestHashedNameIsStableAndNATSSafe(t *testing.T) {
 		t.Fatalf("len(hashedName()) = %d, want 67", len(first))
 	}
 }
+
+func TestNATSControlHeadersAreNotApplicationMetadata(t *testing.T) {
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{name: "Nats-Msg-Id", want: true},
+		{name: "Nats-Expected-Stream", want: true},
+		{name: "nats-custom-control", want: true},
+		{name: "traceparent", want: false},
+		{name: "tracestate", want: false},
+		{name: "baggage", want: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isNATSControlHeader(test.name); got != test.want {
+				t.Fatalf("isNATSControlHeader(%q) = %t, want %t", test.name, got, test.want)
+			}
+		})
+	}
+}

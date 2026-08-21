@@ -248,7 +248,7 @@ func (b *NATSBroker) Receive(ctx context.Context, subscription Subscription) (De
 	}
 	headers := make(map[string]string)
 	for name := range message.Headers() {
-		if name == jetstream.MsgIDHeader {
+		if isNATSControlHeader(name) {
 			continue
 		}
 		headers[strings.ToLower(name)] = message.Headers().Get(name)
@@ -266,6 +266,10 @@ func (b *NATSBroker) Receive(ctx context.Context, subscription Subscription) (De
 		deliveryCount: metadata.NumDelivered,
 		messageHandle: message,
 	}, nil
+}
+
+func isNATSControlHeader(name string) bool {
+	return strings.HasPrefix(strings.ToLower(name), "nats-")
 }
 
 // Ping verifies that the NATS connection can complete a protocol round trip.
