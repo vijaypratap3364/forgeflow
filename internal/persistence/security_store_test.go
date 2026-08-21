@@ -2,6 +2,7 @@ package persistence
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -96,4 +97,54 @@ func TestFileStoreOwnedWorkflowRejectsCrossProjectOwner(t *testing.T) {
 	if _, found, loadErr := store.LoadWorkflow(context.Background(), definition.ID); loadErr != nil || found {
 		t.Fatalf("LoadWorkflow() after rejected ownership = found %v, error %v", found, loadErr)
 	}
+}
+
+func TestFileStoreProjectUpdateAndAuditAreAtomic(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "forgeflow.ffdb")
+	store, err := OpenFileStore(path)
+	if err != nil {
+		t.Fatalf("OpenFileStore() error = %v", err)
+	}
+	now := time.Date(2026, 8, 21, 15, 0, 0, 0, time.UTC)
+	admin := security.User{ID: "atomic-admin", DisplayName: "Atomic Admin", CreatedAt: now}
+	project := security.Project{ID: "atomic-project", Name: "Original", CreatedBy: admin.ID, CreatedAt: now, UpdatedAt: now}
+	membership := security.Membership{ProjectID: project.ID, UserID: admin.ID, Role: security.RoleAdmin,
+		CreatedAt: now, UpdatedAt: now}
+	createdEvent := security.AuditEvent{ID: "atomic-audit", ProjectID: project.ID, ActorUserID: admin.ID,
+		Action: "project.created", ResourceType: "project", ResourceID: string(project.ID), OccurredAt: now}
+	if err := store.CreateProject(ctx, admin, project, membership, createdEvent); err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+
+	updated := project
+	updated.Name = "Must Roll Back"
+	updated.UpdatedAt = now.Add(time.Minute)
+	duplicateEvent := security.AuditEvent{ID: createdEvent.ID, ProjectID: project.ID, ActorUserID: admin.ID,
+		Action: "project.updated", ResourceType: "project", ResourceID: string(project.ID), OccurredAt: updated.UpdatedAt}
+	var conflict *security.AuditEventAlreadyExistsError
+	if err := store.SaveProject(ctx, updated, duplicateEvent); !errors.As(err, &conflict) {
+		t.Fatalf("SaveProject() error = %T %v, want *AuditEventAlreadyExistsError", err, err)
+	}
+
+	for _, candidate := range []*FileStore{store, mustReopenFileStore(t, path)} {
+		got, found, err := candidate.LoadProject(ctx, project.ID)
+		if err != nil || !found || got != project {
+			t.Fatalf("LoadProject() after rejected update = %#v, %v, %v; want %#v, true, nil", got, found, err, project)
+		}
+		events, err := candidate.ListAuditEvents(ctx, project.ID, 10)
+		if err != nil || len(events) != 1 || events[0].ID != createdEvent.ID || events[0].Action != "project.created" {
+			t.Fatalf("ListAuditEvents() after rejected update = %#v, error %v", events, err)
+		}
+	}
+}
+
+func mustReopenFileStore(t *testing.T, path string) *FileStore {
+	t.Helper()
+	store, err := OpenFileStore(path)
+	if err != nil {
+		t.Fatalf("reopen OpenFileStore() error = %v", err)
+	}
+	return store
 }

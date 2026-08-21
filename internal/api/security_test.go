@@ -104,10 +104,28 @@ func TestProjectRBACOwnershipAndAdministrativeAudit(t *testing.T) {
 	wrongProject := securityRequest(t, server, http.MethodGet, "/api/v1/workflows/secure-workflow", "", "", outsiderToken)
 	assertStatus(t, wrongProject, http.StatusNotFound)
 	assertErrorCode(t, wrongProject, "project_not_found")
+	wrongProjectRun := securityRequest(t, server, http.MethodGet, "/api/v1/runs/secure-run", "", "", outsiderToken)
+	assertStatus(t, wrongProjectRun, http.StatusNotFound)
+	assertErrorCode(t, wrongProjectRun, "project_not_found")
+	wrongProjectStart := securityRequest(t, server, http.MethodPost, "/api/v1/workflows/secure-workflow/runs",
+		`{"run_id":"cross-project-run"}`, "application/json", outsiderToken)
+	assertStatus(t, wrongProjectStart, http.StatusNotFound)
+	assertErrorCode(t, wrongProjectStart, "project_not_found")
+	if _, found, err := store.LoadRun(context.Background(), "cross-project-run"); err != nil || found {
+		t.Fatalf("cross-project run persisted = found %v, error %v", found, err)
+	}
 
 	memberAdmin := securityRequest(t, server, http.MethodPut, "/api/v1/projects/project-main/members/new-user",
 		`{"display_name":"New User","role":"member"}`, "application/json", memberToken)
 	assertStatus(t, memberAdmin, http.StatusForbidden)
+	memberEscalation := securityRequest(t, server, http.MethodPut, "/api/v1/projects/project-main/members/member",
+		`{"display_name":"Member","role":"admin"}`, "application/json", memberToken)
+	assertStatus(t, memberEscalation, http.StatusForbidden)
+	assertErrorCode(t, memberEscalation, "forbidden")
+	operatorEscalation := securityRequest(t, server, http.MethodPut, "/api/v1/projects/project-main/members/operator",
+		`{"display_name":"Operator","role":"admin"}`, "application/json", operatorToken)
+	assertStatus(t, operatorEscalation, http.StatusForbidden)
+	assertErrorCode(t, operatorEscalation, "forbidden")
 	memberProjectUpdate := securityRequest(t, server, http.MethodPatch, "/api/v1/projects/project-main",
 		`{"name":"Denied Rename"}`, "application/json", memberToken)
 	assertStatus(t, memberProjectUpdate, http.StatusForbidden)
@@ -124,6 +142,18 @@ func TestProjectRBACOwnershipAndAdministrativeAudit(t *testing.T) {
 	decodeResponse(t, audit, &auditResponse)
 	if len(auditResponse.Events) < 2 || auditResponse.Events[0].Action != "membership.updated" {
 		t.Fatalf("audit events = %#v, want membership update followed by project creation", auditResponse.Events)
+	}
+	actions := make(map[string]int)
+	for _, event := range auditResponse.Events {
+		actions[event.Action]++
+	}
+	if actions["project.created"] == 0 || actions["project.updated"] == 0 || actions["membership.updated"] == 0 {
+		t.Fatalf("audit action counts = %#v, want project creation/update and membership update", actions)
+	}
+	latest := auditResponse.Events[0]
+	if latest.ActorUserID != "admin" || latest.ResourceType != "user" || latest.ResourceID != "new-user" ||
+		latest.Metadata["new_role"] != "operator" {
+		t.Fatalf("latest administrative audit event = %#v", latest)
 	}
 }
 
@@ -147,18 +177,34 @@ func TestAuthenticatedAPIRateLimit(t *testing.T) {
 	server, store, issue := newSecurityTestServer(t, 2)
 	provisionProjectSecurity(t, store)
 	token := issue(t, "member", "Member", time.Now().Add(time.Hour))
+	var allowed []*httptest.ResponseRecorder
 	for index := 0; index < 2; index++ {
 		response := securityRequest(t, server, http.MethodGet, "/api/v1/projects/project-main", "", "", token)
 		assertStatus(t, response, http.StatusOK)
+		allowed = append(allowed, response)
+	}
+	if allowed[0].Header().Get("RateLimit-Limit") != "2" || allowed[0].Header().Get("RateLimit-Remaining") != "1" {
+		t.Fatalf("first rate-limit headers = %#v", allowed[0].Header())
+	}
+	if allowed[1].Header().Get("RateLimit-Remaining") != "0" {
+		t.Fatalf("second rate-limit headers = %#v", allowed[1].Header())
+	}
+	resetAt := allowed[0].Header().Get("RateLimit-Reset")
+	if resetAt == "" || allowed[1].Header().Get("RateLimit-Reset") != resetAt {
+		t.Fatalf("allowed rate-limit reset headers = first %q, second %q", resetAt, allowed[1].Header().Get("RateLimit-Reset"))
 	}
 	limited := securityRequest(t, server, http.MethodGet, "/api/v1/projects/project-main", "", "", token)
 	assertStatus(t, limited, http.StatusTooManyRequests)
 	assertErrorCode(t, limited, "rate_limited")
-	if limited.Header().Get("Retry-After") == "" || limited.Header().Get("RateLimit-Limit") != "2" {
+	if limited.Header().Get("Retry-After") == "" || limited.Header().Get("RateLimit-Limit") != "2" ||
+		limited.Header().Get("RateLimit-Remaining") != "0" || limited.Header().Get("RateLimit-Reset") != resetAt {
 		t.Fatalf("rate-limit headers = %#v", limited.Header())
 	}
 	probe := securityRequest(t, server, http.MethodGet, "/healthz", "", "", "")
 	assertStatus(t, probe, http.StatusOK)
+	if probe.Header().Get("RateLimit-Limit") != "" {
+		t.Fatalf("public health probe was rate limited: headers = %#v", probe.Header())
+	}
 }
 
 func newSecurityTestServer(

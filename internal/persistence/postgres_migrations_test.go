@@ -35,4 +35,16 @@ func TestPostgresMigrationsAreEmbeddedAndVersioned(t *testing.T) {
 			t.Errorf("initial migration does not create %s", table)
 		}
 	}
+	if len(migrations) < 2 {
+		t.Fatalf("migration count = %d, want security migration", len(migrations))
+	}
+	securityMigration := migrations[1]
+	if securityMigration.version != 2 || securityMigration.name != "000002_security.up.sql" {
+		t.Fatalf("security migration identity = %d %q", securityMigration.version, securityMigration.name)
+	}
+	for _, table := range []string{"users", "projects", "project_memberships", "workflow_ownership", "audit_events"} {
+		if !strings.Contains(securityMigration.sql, "CREATE TABLE "+table) {
+			t.Errorf("security migration does not create %s", table)
+		}
+	}
 }

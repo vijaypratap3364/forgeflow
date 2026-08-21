@@ -45,12 +45,27 @@ func TestPostgresStoreProjectAuthorizationContract(t *testing.T) {
 	if err := store.PutMembership(ctx, member, membership, membershipEvent); err != nil {
 		t.Fatalf("PutMembership() error = %v", err)
 	}
+	updatedProject := project
+	updatedProject.Name = "Renamed PostgreSQL Project"
+	updatedProject.UpdatedAt = now.Add(2 * time.Second)
+	projectUpdateEvent := security.AuditEvent{ID: "pg-audit-project-update", ProjectID: project.ID, ActorUserID: admin.ID,
+		Action: "project.updated", ResourceType: "project", ResourceID: string(project.ID), OccurredAt: updatedProject.UpdatedAt,
+		Metadata: map[string]string{"old_name": project.Name, "new_name": updatedProject.Name}}
+	if err := store.SaveProject(ctx, updatedProject, projectUpdateEvent); err != nil {
+		t.Fatalf("SaveProject() error = %v", err)
+	}
+	gotProject, found, err := store.LoadProject(ctx, project.ID)
+	if err != nil || !found || gotProject.ID != updatedProject.ID || gotProject.Name != updatedProject.Name ||
+		gotProject.CreatedBy != updatedProject.CreatedBy || !gotProject.CreatedAt.Equal(updatedProject.CreatedAt) ||
+		!gotProject.UpdatedAt.Equal(updatedProject.UpdatedAt) {
+		t.Fatalf("LoadProject() = %#v, %v, %v; want %#v, true, nil", gotProject, found, err, updatedProject)
+	}
 
 	definition := workflow.WorkflowDefinition{ID: "pg-owned-workflow", Tasks: []workflow.TaskDefinition{
 		{ID: "task", Name: "Task", Handler: "noop"},
 	}}
 	ownership := security.WorkflowOwnership{WorkflowID: definition.ID, ProjectID: project.ID,
-		OwnerUserID: member.ID, CreatedAt: now.Add(2 * time.Second)}
+		OwnerUserID: member.ID, CreatedAt: now.Add(3 * time.Second)}
 	if err := store.SaveWorkflowForProject(ctx, definition, ownership); err != nil {
 		t.Fatalf("SaveWorkflowForProject() error = %v", err)
 	}
@@ -65,9 +80,54 @@ func TestPostgresStoreProjectAuthorizationContract(t *testing.T) {
 		t.Fatalf("ListMemberships() = %#v, error %v", memberships, err)
 	}
 	events, err := store.ListAuditEvents(ctx, project.ID, 10)
-	if err != nil || len(events) != 2 || events[0].ID != membershipEvent.ID ||
-		!reflect.DeepEqual(events[0].Metadata, membershipEvent.Metadata) {
+	if err != nil || len(events) != 3 || events[0].ID != projectUpdateEvent.ID ||
+		!reflect.DeepEqual(events[0].Metadata, projectUpdateEvent.Metadata) {
 		t.Fatalf("ListAuditEvents() = %#v, error %v", events, err)
+	}
+
+	rejectedUpdate := updatedProject
+	rejectedUpdate.Name = "Must Roll Back"
+	rejectedUpdate.UpdatedAt = now.Add(4 * time.Second)
+	duplicateAudit := security.AuditEvent{ID: createdEvent.ID, ProjectID: project.ID, ActorUserID: admin.ID,
+		Action: "project.updated", ResourceType: "project", ResourceID: string(project.ID), OccurredAt: rejectedUpdate.UpdatedAt}
+	var auditConflict *security.AuditEventAlreadyExistsError
+	if err := store.SaveProject(ctx, rejectedUpdate, duplicateAudit); !errors.As(err, &auditConflict) {
+		t.Fatalf("SaveProject() duplicate audit error = %T %v, want *AuditEventAlreadyExistsError", err, err)
+	}
+	rolledBackProject, found, err := store.LoadProject(ctx, project.ID)
+	if err != nil || !found || rolledBackProject.Name != updatedProject.Name ||
+		!rolledBackProject.UpdatedAt.Equal(updatedProject.UpdatedAt) {
+		t.Fatalf("LoadProject() after rolled-back audit = %#v, %v, %v; want %#v, true, nil", rolledBackProject, found, err, updatedProject)
+	}
+	rolledBackEvents, err := store.ListAuditEvents(ctx, project.ID, 10)
+	if err != nil || len(rolledBackEvents) != 3 {
+		t.Fatalf("ListAuditEvents() after rolled-back audit = %#v, error %v", rolledBackEvents, err)
+	}
+
+	outsider := security.User{ID: "pg-outsider", DisplayName: "PostgreSQL Outsider", CreatedAt: now.Add(5 * time.Second)}
+	otherProject := security.Project{ID: "pg-other-project", Name: "Other Project", CreatedBy: outsider.ID,
+		CreatedAt: outsider.CreatedAt, UpdatedAt: outsider.CreatedAt}
+	otherMembership := security.Membership{ProjectID: otherProject.ID, UserID: outsider.ID, Role: security.RoleAdmin,
+		CreatedAt: outsider.CreatedAt, UpdatedAt: outsider.CreatedAt}
+	otherEvent := security.AuditEvent{ID: "pg-other-project-created", ProjectID: otherProject.ID, ActorUserID: outsider.ID,
+		Action: "project.created", ResourceType: "project", ResourceID: string(otherProject.ID), OccurredAt: outsider.CreatedAt}
+	if err := store.CreateProject(ctx, outsider, otherProject, otherMembership, otherEvent); err != nil {
+		t.Fatalf("CreateProject(other) error = %v", err)
+	}
+	rejectedDefinition := workflow.WorkflowDefinition{ID: "pg-rejected-owner", Tasks: []workflow.TaskDefinition{
+		{ID: "task", Name: "Task", Handler: "noop"},
+	}}
+	err = store.SaveWorkflowForProject(ctx, rejectedDefinition, security.WorkflowOwnership{
+		WorkflowID: rejectedDefinition.ID, ProjectID: project.ID, OwnerUserID: outsider.ID, CreatedAt: now.Add(6 * time.Second),
+	})
+	if err == nil {
+		t.Fatal("SaveWorkflowForProject() cross-project owner error = nil")
+	}
+	if _, found, loadErr := store.LoadWorkflow(ctx, rejectedDefinition.ID); loadErr != nil || found {
+		t.Fatalf("LoadWorkflow() after rejected ownership = found %v, error %v", found, loadErr)
+	}
+	if _, found, loadErr := store.LoadWorkflowOwnership(ctx, rejectedDefinition.ID); loadErr != nil || found {
+		t.Fatalf("LoadWorkflowOwnership() after rejected ownership = found %v, error %v", found, loadErr)
 	}
 }
 
@@ -297,6 +357,7 @@ func TestPostgresMigrationCreatesClaimConstraintsAndIndexes(t *testing.T) {
 	}
 	sort.Strings(constraints)
 	for _, constraint := range []string{
+		"project_memberships_role_valid",
 		"task_definitions_pkey",
 		"task_dependencies_dependency_fk",
 		"task_leases_attempt_unique",
@@ -304,6 +365,7 @@ func TestPostgresMigrationCreatesClaimConstraintsAndIndexes(t *testing.T) {
 		"task_leases_worker_unique",
 		"workflow_runs_status_valid",
 		"workflow_runs_workflow_fk",
+		"workflow_ownership_member_fk",
 	} {
 		position := sort.SearchStrings(constraints, constraint)
 		if position == len(constraints) || constraints[position] != constraint {
@@ -325,6 +387,10 @@ func TestPostgresMigrationCreatesClaimConstraintsAndIndexes(t *testing.T) {
 	}
 	sort.Strings(indexes)
 	for _, index := range []string{
+		"audit_events_project_occurred_idx",
+		"audit_events_pkey",
+		"project_memberships_pkey",
+		"project_memberships_user_project_idx",
 		"task_definitions_position_unique",
 		"task_dependencies_position_unique",
 		"task_leases_attempt_unique",
@@ -332,6 +398,8 @@ func TestPostgresMigrationCreatesClaimConstraintsAndIndexes(t *testing.T) {
 		"task_runs_pkey",
 		"workers_pkey",
 		"workflow_runs_pkey",
+		"workflow_ownership_pkey",
+		"workflow_ownership_project_workflow_idx",
 	} {
 		position := sort.SearchStrings(indexes, index)
 		if position == len(indexes) || indexes[position] != index {
