@@ -78,11 +78,14 @@ The transport is process-neutral, but the current executable still hosts worker 
 - Add administrative audit events and authenticated-subject rate limiting.
 - Document the threat model and the protections explicitly left to an issuer or deployment edge.
 
-## Stage 9 — Operations and scale evidence
+## Stage 9 — Observability (complete)
 
-- Add structured logs, metrics, traces, health checks, and operational runbooks.
-- Build repeatable load and soak tests with stored configurations and raw results.
-- Measure bottlenecks and tune from evidence; never invent performance figures.
+- Emit structured JSON logs with request, workflow-run, task-run, worker, and trace correlation.
+- Expose process-local Prometheus metrics without requiring a local monitoring stack.
+- Propagate and export OpenTelemetry traces across HTTP, scheduling, broker, worker, and persistence boundaries.
+- Distinguish liveness from dependency-aware readiness and document an operational correlation workflow.
+
+Repeatable load/soak tests and evidence-based tuning remain future work. No performance figures are claimed without stored test configurations and raw results.
 
 ## Stage 10 — Cloud deployment and security hardening
 

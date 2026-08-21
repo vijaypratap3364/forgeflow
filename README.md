@@ -8,11 +8,11 @@ Reliable workflow execution is more than running functions in order. A useful en
 
 ## Current status
 
-**Stage 8: authenticated multi-project API.** ForgeFlow now provides validated workflow definitions, explicit workflow/task run state machines, a scheduler, a safe task-handler registry, configurable concurrent workers, retry policy with exponential backoff, identified task attempts, worker heartbeats, expiring task leases, a versioned REST API with live Server-Sent Events (SSE), interchangeable embedded-file and PostgreSQL stores, interchangeable in-memory and NATS JetStream task brokers, Ed25519 JWT authentication, project-scoped RBAC, workflow ownership, administrative audit events, and API rate limiting.
+**Stage 9: observable workflow execution.** ForgeFlow now provides validated workflow definitions, explicit workflow/task run state machines, a scheduler, a safe task-handler registry, configurable concurrent workers, retry policy with exponential backoff, identified task attempts, worker heartbeats, expiring task leases, a versioned REST API with live Server-Sent Events (SSE), interchangeable embedded-file and PostgreSQL stores, interchangeable in-memory and NATS JetStream task brokers, Ed25519 JWT authentication, project-scoped RBAC, workflow ownership, administrative audit events, API rate limiting, structured JSON logs, Prometheus-compatible metrics, OpenTelemetry traces, and dependency-aware readiness.
 
 Independent tasks run concurrently, successful dependencies unlock downstream work, and terminal task failure or context cancellation stops unfinished work consistently. Marked transient failures retry within policy using testable exponential backoff. Every dispatch has a stable task-run ID and attempt ID; only the worker holding that attempt's valid persisted lease can commit its result. Heartbeats renew active leases and extend the broker acknowledgement deadline, while expired leases make abandoned work retryable without rerunning already completed tasks. The standard-library HTTP server accepts definitions, starts and cancels asynchronous runs, exposes durable run/task status, and streams persisted transitions. PostgreSQL makes aggregate changes transactional and rejects stale concurrent writers; JetStream provides file-backed work-queue retention, durable pull consumers, acknowledgements, and redelivery.
 
-The current executable still hosts each run's worker goroutines with its scheduler. The broker boundary and JetStream adapter make task delivery network-capable and process-neutral, but a separately deployable worker command and automatic cross-process recovery controller remain future work. Token issuance/login, distributed rate limiting, and deployment infrastructure are not implemented. See [the roadmap](docs/roadmap.md), [architecture notes](docs/architecture.md), and [security model](docs/security.md) for the exact boundaries and guarantees.
+The current executable still hosts each run's worker goroutines with its scheduler. The broker boundary and JetStream adapter make task delivery network-capable and process-neutral, but a separately deployable worker command and automatic cross-process recovery controller remain future work. Token issuance/login, distributed rate limiting, a hosted telemetry stack, and deployment infrastructure are not implemented. See [the roadmap](docs/roadmap.md), [architecture notes](docs/architecture.md), [observability guide](docs/observability.md), and [security model](docs/security.md) for the exact boundaries and guarantees.
 
 ## Local development
 
@@ -82,8 +82,25 @@ The server listens on `127.0.0.1:8080` and writes its embedded journal to `data/
 | `FORGEFLOW_JWT_LEEWAY` | `30s` | Allowed clock skew for time claims |
 | `FORGEFLOW_RATE_LIMIT` | `120` | Authenticated API requests allowed per subject/window |
 | `FORGEFLOW_RATE_LIMIT_WINDOW` | `1m` | In-process fixed rate-limit window |
+| `FORGEFLOW_LOG_LEVEL` | `info` | Minimum structured JSON log level: `debug`, `info`, `warn`, or `error` |
+| `FORGEFLOW_TRACE_EXPORTER` | `none` | Trace exporter: `none`, `stdout`, or `otlp-http` |
+| `FORGEFLOW_SERVICE_NAME` | `forgeflow` | OpenTelemetry `service.name` resource value |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | SDK default | Standard OTLP endpoint used by `otlp-http` |
+| `OTEL_EXPORTER_OTLP_HEADERS` | empty | Optional OTLP headers; keep credentials out of files and logs |
 
 The checked-in [.env.example](.env.example) is a reference; ForgeFlow does not load dotenv files itself.
+
+## Local observability
+
+Every HTTP response includes a server-generated `X-Request-ID`. JSON request and execution logs carry that request ID where available, plus the workflow, workflow-run, task-run, attempt, worker, trace, and span identifiers relevant to the event. Authorization headers, JWTs, task inputs/outputs, database DSNs, and broker URLs are not logged.
+
+Prometheus-compatible process metrics are available without authentication at `GET /metrics`; deployments should restrict probe/metrics access at the network edge. No Prometheus process is required locally:
+
+```text
+curl http://127.0.0.1:8080/metrics
+```
+
+Tracing is a no-op by default but W3C trace context is still accepted and propagated through task messages. For a lightweight local trace dump, set `FORGEFLOW_TRACE_EXPORTER=stdout`. For a remote collector, select `otlp-http` and configure the standard `OTEL_EXPORTER_OTLP_ENDPOINT` and optional `OTEL_EXPORTER_OTLP_HEADERS` variables. See [the observability guide](docs/observability.md) for metric definitions, the trace flow, correlation examples, readiness behavior, and current limitations.
 
 ## API quickstart
 
@@ -129,6 +146,7 @@ The event stream replays transitions retained by the current process and closes 
 | `GET` | `/api/v1/runs/{runID}/events` | Stream persisted state transitions with SSE |
 | `GET` | `/healthz` | Process liveness |
 | `GET` | `/readyz` | Request-serving readiness |
+| `GET` | `/metrics` | Prometheus-compatible process metrics |
 
 ## Repository layout
 
@@ -138,6 +156,7 @@ internal/app/       bootstrap application behavior
 internal/api/       versioned HTTP API, async run lifecycle, and SSE events
 internal/broker/    task transport contract plus in-memory and JetStream adapters
 internal/execution/ run state, scheduler, handlers, and workers
+internal/observability/ structured-log correlation, metrics registry, and tracing setup
 internal/persistence/ embedded and PostgreSQL Store implementations and migrations
 internal/security/  JWT verification, tenancy, roles, and rate limiting
 internal/workflow/  workflow definitions and DAG semantics

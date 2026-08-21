@@ -6,7 +6,7 @@ ForgeFlow now has a real application security boundary, not a complete identity 
 
 ## Authentication
 
-All `/api/v1` routes require `Authorization: Bearer <token>`. `/healthz` and `/readyz` are intentionally public and contain no tenant data.
+All `/api/v1` routes require `Authorization: Bearer <token>`. `/healthz`, `/readyz`, and `/metrics` are intentionally public and contain no tenant identifiers. Metrics expose aggregate process activity, so a production deployment should restrict all three operational endpoints to trusted infrastructure at the network edge.
 
 The configured verifier accepts only Ed25519-signed JWTs using `alg=EdDSA`. It validates the signature and requires matching `iss` and `aud` values, a nonempty stable `sub`, and an unexpired `exp`; standard `nbf` validation applies when present. A small configurable leeway handles clock skew. Failures return the same `401 unauthenticated` envelope so parsing details do not become an oracle. Signing keys are never generated, stored, or logged by ForgeFlow. The PEM public verification key and trust settings come from environment-backed process configuration.
 

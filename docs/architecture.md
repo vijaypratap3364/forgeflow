@@ -8,9 +8,9 @@ This document separates the components that exist today from the remaining distr
 
 ## Current implementation
 
-Stage 8 contains:
+Stage 9 contains:
 
-- a small dependency surface: the Go standard library plus `golang-jwt`, native `pgx`, and `nats.go` clients for security and optional PostgreSQL/NATS access;
+- a focused dependency surface: the Go standard library plus `golang-jwt`, native `pgx`, `nats.go`, and the official OpenTelemetry SDK/exporters for security, optional PostgreSQL/NATS access, and configurable tracing;
 - stable workflow and task identifier types plus in-memory definitions;
 - typed, machine-classifiable validation errors with contextual messages;
 - validation for identifiers, names, task uniqueness, dependency references, repeated edges, self-dependencies, and cycles;
@@ -45,9 +45,14 @@ Stage 8 contains:
 - externally issued Ed25519 JWT verification with required algorithm, signature, issuer, audience, subject, and expiration validation;
 - durable users, projects, workflow ownership, project memberships, and administrative audit events;
 - project-scoped member/operator/admin permissions enforced from persisted resource ownership;
-- a configurable, process-local authenticated-subject rate limiter.
+- a configurable, process-local authenticated-subject rate limiter;
+- structured JSON request and execution-transition logs with stable correlation identifiers;
+- a Prometheus-compatible process metrics endpoint with counters, gauges, and histograms;
+- explicitly injected OpenTelemetry tracing across HTTP, scheduler, broker, worker, and execution persistence operations;
+- W3C trace-context propagation in durable task dispatch messages;
+- dependency-aware readiness checks for PostgreSQL and the active broker.
 
-There is currently no separately deployable worker executable, automatic cross-process recovery controller, token issuer/login service, metrics/tracing stack, or browser UI. The executable runs the local HTTP service with the embedded store and in-memory broker by default. It can independently select PostgreSQL and NATS when explicitly configured. The network broker boundary is current, while extracting the worker runtime from the API/scheduler process is later work.
+There is currently no separately deployable worker executable, automatic cross-process recovery controller, token issuer/login service, hosted metrics/tracing backend, or browser UI. The executable runs the local HTTP service with the embedded store, in-memory broker, in-process metrics registry, and no-op trace exporter by default. It can independently select PostgreSQL, NATS, stdout tracing, and OTLP/HTTP tracing when explicitly configured. The network broker boundary is current, while extracting the worker runtime from the API/scheduler process is later work.
 
 ## Eventual component boundaries
 
@@ -62,7 +67,7 @@ There is currently no separately deployable worker executable, automatic cross-p
 | Recovery controller | Detect expired leases and make abandoned work eligible again | Current in scheduler; distributed controller future |
 | Security boundary | Authenticate JWT subjects and authorize project-owned resources | Current; external token issuer required |
 | API | Manage projects/workflows; create, inspect, stream, retry, and cancel runs | Current, HTTP/JSON and SSE |
-| Observability | Provide structured logs, metrics, traces, and operational diagnostics | Future |
+| Observability | Provide structured logs, metrics, traces, health checks, and correlation diagnostics | Current; external telemetry backends optional |
 
 The persistence and messaging choices are independent boundaries. Lightweight local operation uses `FileStore` plus `InMemoryBroker`; a distributed deployment should use PostgreSQL plus NATS JetStream. `FileStore` remains a single-process component and must not be shared by multiple ForgeFlow processes merely because NATS is network-accessible.
 
@@ -107,7 +112,7 @@ The engine clock and timers are interfaces. Production uses the standard library
 
 ## Task broker boundary
 
-`internal/broker` defines five transport operations: publish a stable task message, receive one delivery for a durable competing-consumer subscription, acknowledge completed delivery, negatively acknowledge work that should be offered again, and report progress for long-running work. Message bodies carry run, task, task-run, and attempt identities; broker subjects and durable names use stable SHA-256-derived tokens so user-controlled identifiers cannot inject NATS wildcards. The scheduler and workers know only this interface.
+`internal/broker` defines five transport operations: publish a stable task message, receive one delivery for a durable competing-consumer subscription, acknowledge completed delivery, negatively acknowledge work that should be offered again, and report progress for long-running work. Message bodies carry run, task, task-run, and attempt identities; validated lowercase message headers carry propagation metadata. Headers are excluded from stable-ID logical-content checks and the first accepted publication wins, so a changed trace does not turn a safe republish into a message conflict. Broker subjects and durable names use stable SHA-256-derived tokens so user-controlled identifiers cannot inject NATS wildcards. The scheduler and workers know only this interface.
 
 `InMemoryBroker` keeps a process-lifetime message log, makes identical publication of a stable message ID idempotent, and divides a subscription's deliveries among competing receivers. It is deterministic and concurrency-safe, so all ordinary engine tests exercise the real broker boundary without a service. It does not pretend to survive process exit or emulate a server-side acknowledgement timer. Worker cancellation and injected disappearance explicitly nack active in-memory deliveries.
 
@@ -121,7 +126,7 @@ The current executable composes the scheduler and worker goroutines in one proce
 
 The `internal/api` package keeps JSON request and response types separate from workflow and execution aggregates. Requests use strict JSON decoding, reject unknown fields and bodies larger than 1 MiB, and translate typed domain errors into stable error envelopes with useful HTTP status codes. Go duration strings such as `100ms` and `2s` are parsed only at the transport boundary.
 
-Every `/api/v1` request passes through bearer-token authentication and the authenticated-subject rate limiter; health and readiness remain public for orchestrators. The verifier accepts only Ed25519/EdDSA and requires the configured issuer, audience, expiration, and a valid subject. Role claims are intentionally ignored. After authentication, handlers derive the project from durable workflow ownership (and runs through their workflow) and load the caller's persisted membership. A missing membership returns a tenant-concealing `404`; a known member without the required permission receives `403`. This separates credential validity (`401`) from resource authorization (`403`/`404`).
+Every `/api/v1` request passes through bearer-token authentication and the authenticated-subject rate limiter; health, readiness, and metrics remain public for trusted operational infrastructure. The verifier accepts only Ed25519/EdDSA and requires the configured issuer, audience, expiration, and a valid subject. Role claims are intentionally ignored. After authentication, handlers derive the project from durable workflow ownership (and runs through their workflow) and load the caller's persisted membership. A missing membership returns a tenant-concealing `404`; a known member without the required permission receives `403`. This separates credential validity (`401`) from resource authorization (`403`/`404`).
 
 An authenticated subject may create a project and becomes its initial admin in the same store transaction. Members can create workflows, start runs, and inspect aggregate run state. Operators additionally inspect task failures and cancel or retry runs. A retry creates a new run rather than rewriting the source run's history. Admins manage project metadata and memberships and read administrative audit events. Project creation, project updates, and membership updates commit their audit record atomically with the changed security state.
 
@@ -129,7 +134,30 @@ An authenticated subject may create a project and becomes its initial admin in t
 
 Run and task GET endpoints read the latest snapshot from `execution.Store`, rather than relying on an API-only cache. The event stream is also downstream of persistence: a small Store decorator observes only successful `CreateRun` and `SaveRun` calls, compares consecutive snapshots, and publishes typed SSE transitions. Its append-only in-memory event history supports `Last-Event-ID` replay for the lifetime of the current process without turning the local journal into an event-sourcing API. After a restart, durable status remains authoritative, but the previous process's SSE history is not reconstructed.
 
-`/healthz` reports process liveness. `/readyz` reports whether the server is accepting work and changes to unavailable during shutdown. PostgreSQL is pinged and migrated before the listener starts when that backend is selected, but readiness is not yet a continuous dependency probe. On SIGINT or SIGTERM the process stops accepting HTTP connections, cancels active runs, waits for engine goroutines within a configurable deadline, closes SSE streams, and completes `http.Server.Shutdown`.
+`/healthz` reports only process liveness. `/readyz` reports whether the server is accepting work and actively checks dependencies: PostgreSQL receives a pool ping when selected, NATS receives a protocol flush when selected, and the in-memory broker verifies that it remains open. The embedded file store has no remote dependency to probe. Readiness changes to unavailable during shutdown. On SIGINT or SIGTERM the process stops accepting HTTP connections, cancels active runs, waits for engine goroutines within a configurable deadline, closes SSE streams, flushes the configured trace provider, and completes `http.Server.Shutdown`.
+
+## Observability and correlation
+
+The process injects one `observability.Instrumentation` bundle instead of mutating package-global logger, meter, or tracer state. Its `slog` JSON handler writes structured events, its concurrency-safe metrics registry renders the Prometheus 0.0.4 text format, and its explicitly owned OpenTelemetry provider is shut down with the process. The default trace provider is no-op, so local development starts no background telemetry process. `stdout` is available for local trace inspection; `otlp-http` uses the standard `OTEL_EXPORTER_OTLP_*` environment variables for a remote collector.
+
+Every request receives a new server-owned request ID returned as `X-Request-ID`. Incoming W3C `traceparent`/`tracestate` and baggage are extracted before the HTTP server span starts. Accepted workflow execution detaches client cancellation but retains request and trace values under a server-owned cancel context. A scheduler span creates a producer span for each stable attempt message and injects W3C context into that message's transport headers. The stable message body remains unchanged if a scheduler republishes the same attempt. The worker extracts the headers before its consumer/execution span. Execution-store calls are wrapped in client spans, yielding this trace chain:
+
+```text
+HTTP server span
+  -> persistence.create_run
+  -> scheduler.recover
+       -> persistence.load/save_run
+       -> broker.publish (inject trace context)
+       -> broker.receive
+       -> worker.execute (extract context; parent is broker.publish)
+            -> persistence.save_run
+```
+
+Logs use identifiers as fields: `request_id`, `workflow_id`, `workflow_run_id`, `task_id`, `task_run_id`, `attempt_id`, `worker_id`, `trace_id`, and `span_id` appear when relevant. The implementation never logs authorization headers, JWTs, task inputs/outputs, PostgreSQL DSNs, or NATS URLs. Metrics intentionally omit resource IDs to keep label cardinality bounded; labels are limited to HTTP method/route/status and task outcome.
+
+`/metrics` exposes workflow submission and terminal outcome counters; task execution, failure, and retry counters; active-worker, running-task, and queue gauges; and HTTP, task, and workflow duration histograms. All values are process-local and reset on restart. `forgeflow_queue_depth` counts task messages published by the current process but not yet claimed by its scheduler; it is not a JetStream-wide backlog query. A future distributed control plane should replace that gauge with backend-specific aggregate collection rather than presenting the current value as cluster-wide.
+
+The complete metric names, example configuration, and correlation runbook are in [observability.md](observability.md).
 
 ## Persistence boundary and storage backends
 
