@@ -8,13 +8,34 @@ Reliable workflow execution is more than running functions in order. A useful en
 
 ## Current status
 
-**Stage 9: observable workflow execution.** ForgeFlow now provides validated workflow definitions, explicit workflow/task run state machines, a scheduler, a safe task-handler registry, configurable concurrent workers, retry policy with exponential backoff, identified task attempts, worker heartbeats, expiring task leases, a versioned REST API with live Server-Sent Events (SSE), interchangeable embedded-file and PostgreSQL stores, interchangeable in-memory and NATS JetStream task brokers, Ed25519 JWT authentication, project-scoped RBAC, workflow ownership, administrative audit events, API rate limiting, structured JSON logs, Prometheus-compatible metrics, OpenTelemetry traces, and dependency-aware readiness.
+**Stage 10: quality-gated v1.** ForgeFlow now provides validated workflow definitions, explicit workflow/task run state machines, a scheduler, a safe task-handler registry, configurable concurrent workers, retry policy with exponential backoff, identified task attempts, worker heartbeats, expiring task leases, a versioned REST API with live Server-Sent Events (SSE), interchangeable embedded-file and PostgreSQL stores, interchangeable in-memory and NATS JetStream task brokers, Ed25519 JWT authentication, project-scoped RBAC, workflow ownership, administrative audit events, API rate limiting, structured JSON logs, Prometheus-compatible metrics, OpenTelemetry traces, dependency-aware readiness, deterministic concurrency/fault tests, and a CI quality gate over both production adapters.
 
 Independent tasks run concurrently, successful dependencies unlock downstream work, and terminal task failure or context cancellation stops unfinished work consistently. Marked transient failures retry within policy using testable exponential backoff. Every dispatch has a stable task-run ID and attempt ID; only the worker holding that attempt's valid persisted lease can commit its result. Heartbeats renew active leases and extend the broker acknowledgement deadline, while expired leases make abandoned work retryable without rerunning already completed tasks. The standard-library HTTP server accepts definitions, starts and cancels asynchronous runs, exposes durable run/task status, and streams persisted transitions. PostgreSQL makes aggregate changes transactional and rejects stale concurrent writers; JetStream provides file-backed work-queue retention, durable pull consumers, acknowledgements, and redelivery.
 
-The current executable still hosts each run's worker goroutines with its scheduler. The broker boundary and JetStream adapter make task delivery network-capable and process-neutral, but a separately deployable worker command and automatic cross-process recovery controller remain future work. Token issuance/login, distributed rate limiting, a hosted telemetry stack, and deployment infrastructure are not implemented. See [the roadmap](docs/roadmap.md), [architecture notes](docs/architecture.md), [observability guide](docs/observability.md), and [security model](docs/security.md) for the exact boundaries and guarantees.
+The current executable still hosts each run's worker goroutines with its scheduler. The broker boundary and JetStream adapter make task delivery network-capable and process-neutral, but a separately deployable worker command and automatic cross-process recovery controller remain future work. Token issuance/login, distributed rate limiting, a hosted telemetry stack, and deployment infrastructure are not implemented. See [the roadmap](docs/roadmap.md), [architecture notes](docs/architecture.md), [interview notes](docs/interview-notes.md), [observability guide](docs/observability.md), and [security model](docs/security.md) for the exact boundaries and guarantees.
 
-## Local development
+## Architecture overview
+
+```text
+HTTP/JSON + SSE
+       |
+authentication, project RBAC, rate limits
+       |
+API run manager -> one scheduler loop per active workflow run
+                    |
+                    +--> Store interface --> file journal / PostgreSQL
+                    |
+                    +--> Broker interface --> in-memory / JetStream
+                                  ^
+                                  |
+                         bounded worker pool
+                                  |
+                         safe task handlers
+```
+
+The persisted workflow-run aggregate is the authority for task state, attempts, leases, and completion. A broker delivery offers work but does not prove ownership: a worker must first obtain a persisted lease for the exact task-run and attempt identity. Structured logs, bounded-cardinality metrics, and trace propagation cross the API, scheduler, broker, worker, and persistence boundaries.
+
+## Setup and local development
 
 Local development is intentionally lightweight because the primary development machine has limited memory. ForgeFlow uses the native Go toolchain and keeps the embedded file store plus in-memory broker as its defaults. It does not require Docker Desktop, WSL, Kubernetes, Kafka, a database service, a broker service, or any background process. The pure-Go `pgx` and `nats.go` dependencies compile the optional production adapters without installing PostgreSQL or NATS locally.
 
@@ -62,6 +83,22 @@ go build ./...
 
 On systems with `make`, `make check` runs formatting, vetting, tests, and a build.
 
+## Testing and quality gates
+
+The ordinary local gate is native Go only and starts no service:
+
+```text
+go fmt ./...
+go vet ./...
+go test ./...
+go test -race ./...
+go build ./...
+```
+
+The deterministic suite uses channels, barriers, injected clocks, and Store/Broker decorators instead of random failures or timing sleeps. It covers simultaneous workflow runs, a wide ready queue, competing claims and duplicate delivery, worker disappearance and lease expiry, retry exhaustion, cancellation, scheduler and persistence restart, graceful shutdown, invalid transitions, and owned worker-loop cleanup.
+
+GitHub Actions additionally verifies module integrity and tidiness, runs Staticcheck and `govulncheck`, repeats the race-enabled suite, and executes real PostgreSQL and NATS JetStream integration tests against temporary CI services. Those service-backed tests are intentionally excluded from `go test ./...`; normal laptop development does not need either server.
+
 The server listens on `127.0.0.1:8080` and writes its embedded journal to `data/forgeflow.ffdb` by default. Configuration is read from the process environment:
 
 | Variable | Default | Purpose |
@@ -102,7 +139,7 @@ curl http://127.0.0.1:8080/metrics
 
 Tracing is a no-op by default but W3C trace context is still accepted and propagated through task messages. For a lightweight local trace dump, set `FORGEFLOW_TRACE_EXPORTER=stdout`. For a remote collector, select `otlp-http` and configure the standard `OTEL_EXPORTER_OTLP_ENDPOINT` and optional `OTEL_EXPORTER_OTLP_HEADERS` variables. See [the observability guide](docs/observability.md) for metric definitions, the trace flow, correlation examples, readiness behavior, and current limitations.
 
-## API quickstart
+## Demo workflow and API quickstart
 
 ForgeFlow validates externally issued Ed25519 JWTs; it deliberately does not contain a login or token-minting endpoint. Configure the verifier, obtain a token whose `iss` and `aud` match, and export it as `TOKEN`. The token subject can create a project and becomes its first admin:
 
@@ -164,3 +201,13 @@ docs/               architecture and delivery roadmap
 ```
 
 The module uses the canonical import path `github.com/vijaypratap3364/forgeflow`, derived from the configured `origin` remote.
+
+## Current limitations
+
+- The API process owns each active run's scheduler and worker goroutines; there is no separately deployable worker command or automatic cross-process scan for nonterminal runs yet.
+- Handler execution is at-least-once across the crash window around external effects. Exactly-once effects require downstream idempotency or a shared transaction boundary.
+- The file journal is single-process, append-only, and uncompacted. PostgreSQL is the multi-process production Store.
+- No atomic transaction spans a Store transition and broker publication; persisted attempt identities and recovery make duplicates safe inside ForgeFlow but cannot eliminate every external effect duplicate.
+- SSE replay history, metrics, and rate-limit counters are process-local even though current workflow/run state is durable.
+- JWT issuance, key discovery/rotation, TLS termination, hosted telemetry, backups, deployment manifests, and browser UI remain outside this v1.
+- No throughput, latency, or scale claims are made without a repeatable workload and retained raw results.

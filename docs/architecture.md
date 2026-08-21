@@ -8,7 +8,7 @@ This document separates the components that exist today from the remaining distr
 
 ## Current implementation
 
-Stage 9 contains:
+Stage 10 contains:
 
 - a focused dependency surface: the Go standard library plus `golang-jwt`, native `pgx`, `nats.go`, and the official OpenTelemetry SDK/exporters for security, optional PostgreSQL/NATS access, and configurable tracing;
 - stable workflow and task identifier types plus in-memory definitions;
@@ -41,7 +41,10 @@ Stage 9 contains:
 - replayable live Server-Sent Events derived from persisted transitions;
 - liveness, readiness, configurable process settings, and graceful shutdown;
 - handler tests built with `httptest` plus deterministic domain, engine, and broker contract tests;
-- opt-in JetStream integration tests run against a pinned standalone NATS server in GitHub Actions.
+- deterministic contention and fault-injection tests for wide ready queues, concurrent workflows, duplicate delivery, lease recovery, cancellation, and worker-loop cleanup;
+- race-enabled unit and PostgreSQL/JetStream integration suites in GitHub Actions;
+- CI enforcement of formatting, module consistency, vetting, tests, builds, Staticcheck, and reachable-vulnerability scanning;
+- opt-in JetStream integration tests run against a pinned standalone NATS server in GitHub Actions;
 - externally issued Ed25519 JWT verification with required algorithm, signature, issuer, audience, subject, and expiration validation;
 - durable users, projects, workflow ownership, project memberships, and administrative audit events;
 - project-scoped member/operator/admin permissions enforced from persisted resource ownership;
@@ -217,4 +220,4 @@ That extraction will not change the core rule already enforced today: the state 
 
 Local development must remain viable on a machine with about 5.8 GB of RAM. The design therefore favors native Go processes, deterministic in-memory tests, and focused test doubles. Normal tests require no external services. PostgreSQL and NATS integration tests run in separate GitHub Actions jobs; an already-installed standalone NATS binary is optional for developers who want to invoke the JetStream suite manually. Docker, WSL, Kafka, and a local multi-service stack are not required.
 
-The current security boundary and its explicit exclusions are documented in [security.md](security.md). Future deployment work must add an identity-provider integration, shared rate limiting, TLS/edge controls, key rotation, and operational audit export without weakening the lightweight local path.
+The current security boundary and its explicit exclusions are documented in [security.md](security.md). The scheduler, delivery, recovery, database, and tradeoff explanations used for technical interviews are collected in [interview-notes.md](interview-notes.md). Future deployment work must add an identity-provider integration, shared rate limiting, TLS/edge controls, key rotation, and operational audit export without weakening the lightweight local path.

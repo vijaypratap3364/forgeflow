@@ -85,9 +85,16 @@ The transport is process-neutral, but the current executable still hosts worker 
 - Propagate and export OpenTelemetry traces across HTTP, scheduling, broker, worker, and persistence boundaries.
 - Distinguish liveness from dependency-aware readiness and document an operational correlation workflow.
 
+## Stage 10 — CI quality gate and concurrency/fault testing (complete)
+
+- Gate formatting, module consistency, vetting, ordinary tests, race-enabled tests, builds, Staticcheck, and reachable-vulnerability scanning in GitHub Actions.
+- Exercise PostgreSQL and NATS JetStream adapters against temporary CI services without adding local infrastructure.
+- Stress simultaneous runs, wide ready queues, duplicate delivery, worker-loop cancellation, lease recovery, retries, restart, shutdown, and invalid transitions with deterministic synchronization.
+- Keep resume/interview documentation honest about delivery guarantees, transaction strategy, tradeoffs, and current limitations.
+
 Repeatable load/soak tests and evidence-based tuning remain future work. No performance figures are claimed without stored test configurations and raw results.
 
-## Stage 10 — Cloud deployment and security hardening
+## Stage 11 — Cloud deployment and security hardening
 
 - Add identity-provider/JWKS integration, key rotation, shared rate limiting, secret management, and stronger tenant controls.
 - Package and deploy the system in remote/cloud environments.
