@@ -81,6 +81,29 @@ func runBrokerContract(t *testing.T, taskBroker Broker) {
 		assertNoBrokerDelivery(t, taskBroker, subscription)
 	})
 
+	t.Run("stable body ignores changed propagation metadata", func(t *testing.T) {
+		message, subscription := contractMessage("metadata-duplicate")
+		if err := taskBroker.Publish(context.Background(), message); err != nil {
+			t.Fatalf("first Publish() error = %v", err)
+		}
+		republished := cloneMessage(message)
+		republished.Headers["traceparent"] = "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"
+		if err := taskBroker.Publish(context.Background(), republished); err != nil {
+			t.Fatalf("metadata-only duplicate Publish() error = %v", err)
+		}
+		delivery, err := taskBroker.Receive(context.Background(), subscription)
+		if err != nil {
+			t.Fatalf("Receive() error = %v", err)
+		}
+		if got := delivery.Message().Headers["traceparent"]; got != message.Headers["traceparent"] {
+			t.Fatalf("traceparent = %q, want first publication %q", got, message.Headers["traceparent"])
+		}
+		if err := delivery.Ack(context.Background()); err != nil {
+			t.Fatalf("Ack() error = %v", err)
+		}
+		assertNoBrokerDelivery(t, taskBroker, subscription)
+	})
+
 	t.Run("competing receivers claim once", func(t *testing.T) {
 		message, subscription := contractMessage("competing")
 		if err := taskBroker.Publish(context.Background(), message); err != nil {
@@ -118,9 +141,10 @@ func contractMessage(label string) (TaskMessage, Subscription) {
 	sequence := contractSequence.Add(1)
 	topic := Topic(fmt.Sprintf("contract-%s-%d", label, sequence))
 	return TaskMessage{
-			ID:    MessageID(fmt.Sprintf("message-%s-%d", label, sequence)),
-			Topic: topic,
-			Body:  []byte("payload-" + label),
+			ID:      MessageID(fmt.Sprintf("message-%s-%d", label, sequence)),
+			Topic:   topic,
+			Body:    []byte("payload-" + label),
+			Headers: map[string]string{"traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"},
 		}, Subscription{
 			ConsumerID: ConsumerID(fmt.Sprintf("consumer-%s-%d", label, sequence)),
 			Topic:      topic,

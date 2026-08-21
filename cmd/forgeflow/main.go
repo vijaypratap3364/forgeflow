@@ -3,7 +3,7 @@ package main
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -12,15 +12,16 @@ import (
 )
 
 func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	config, err := app.ConfigFromEnv()
 	if err != nil {
-		log.Printf("configure ForgeFlow: %v", err)
+		logger.Error("configure ForgeFlow", "error", err)
 		os.Exit(1)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err := app.Run(ctx, config, os.Stdout); err != nil {
-		log.Printf("run ForgeFlow: %v", err)
+		logger.Error("run ForgeFlow", "error", err)
 		os.Exit(1)
 	}
 }

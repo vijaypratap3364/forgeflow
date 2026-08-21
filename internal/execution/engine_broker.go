@@ -7,12 +7,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/vijaypratap3364/forgeflow/internal/broker"
+	"github.com/vijaypratap3364/forgeflow/internal/observability"
 	"github.com/vijaypratap3364/forgeflow/internal/workflow"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type taskDispatch struct {
@@ -23,6 +29,7 @@ type taskDispatch struct {
 }
 
 type brokerTaskResult struct {
+	context   context.Context
 	taskID    workflow.TaskID
 	taskRunID TaskRunID
 	workerID  WorkerID
@@ -90,7 +97,10 @@ func (engine *Engine) executeBrokerRun(
 			engine.config.clock,
 			engine.config.heartbeatInterval,
 			workerIdentity{workerID: workerID, slot: slot},
+			run.id,
+			run.definition.ID,
 			engine.config.taskBroker,
+			engine.config.instrumentation,
 			subscription,
 			claimEvents,
 			heartbeatEvents,
@@ -281,9 +291,15 @@ func (engine *Engine) executeBrokerRun(
 				}
 				delete(ready, dispatch.TaskID)
 				inFlight[attemptID] = struct{}{}
+				engine.config.instrumentation.Metrics().QueueClaimed()
 				activeDeliveries[claim.workerID] = claim.delivery
 				taskDefinition := requireDefinition(definitions, dispatch.TaskID)
+				taskContext := engine.config.instrumentation.Propagator().Extract(
+					ctx,
+					propagation.MapCarrier(message.Headers),
+				)
 				claim.response <- workerClaimResponse{job: &taskJob{
+					context: taskContext,
 					request: TaskRequest{
 						RunID:     run.id,
 						TaskRunID: task.TaskRunID,
@@ -362,6 +378,10 @@ func (engine *Engine) executeBrokerRun(
 			}
 			delete(activeDeliveries, result.workerID)
 			delete(inFlight, result.attemptID)
+			completionContext := durabilityContext
+			if result.context != nil {
+				completionContext = context.WithoutCancel(result.context)
+			}
 			outcome, err := run.completeTaskAttempt(
 				result.taskID,
 				result.taskRunID,
@@ -395,7 +415,7 @@ func (engine *Engine) executeBrokerRun(
 				for _, task := range newReady {
 					ready[task.ID] = task
 				}
-				if err := engine.saveRun(durabilityContext, run, "record completion and unlock dependencies"); err != nil {
+				if err := engine.saveRun(completionContext, run, "record completion and unlock dependencies"); err != nil {
 					if timer != nil {
 						timer.Stop()
 					}
@@ -406,7 +426,7 @@ func (engine *Engine) executeBrokerRun(
 				if task, exists := run.Task(result.taskID); exists && task.Status == TaskRunReady {
 					ready[result.taskID] = requireDefinition(definitions, result.taskID)
 				}
-				if err := engine.saveRun(durabilityContext, run, "schedule task retry"); err != nil {
+				if err := engine.saveRun(completionContext, run, "schedule task retry"); err != nil {
 					if timer != nil {
 						timer.Stop()
 					}
@@ -414,7 +434,7 @@ func (engine *Engine) executeBrokerRun(
 					return run, err
 				}
 			case CompletionFailed:
-				if err := engine.saveRun(durabilityContext, run, "record terminal task failure"); err != nil {
+				if err := engine.saveRun(completionContext, run, "record terminal task failure"); err != nil {
 					if timer != nil {
 						timer.Stop()
 					}
@@ -490,19 +510,44 @@ func (engine *Engine) publishReadyTasks(
 			TaskRunID: task.TaskRunID,
 			AttemptID: attemptID,
 		}
+		publishContext, publishSpan := engine.config.instrumentation.Tracer("forgeflow/execution").Start(
+			ctx,
+			"forgeflow.broker.publish",
+			trace.WithSpanKind(trace.SpanKindProducer),
+			trace.WithAttributes(
+				attribute.String("messaging.system", "forgeflow"),
+				attribute.String("messaging.destination.name", string(taskTopic(run.id))),
+				attribute.String("messaging.message.id", string(attemptID)),
+				attribute.String("forgeflow.workflow.id", string(run.definition.ID)),
+				attribute.String("forgeflow.workflow_run.id", string(run.id)),
+				attribute.String("forgeflow.task.id", string(taskID)),
+				attribute.String("forgeflow.task_run.id", string(task.TaskRunID)),
+			),
+		)
 		body, err := json.Marshal(dispatch)
 		if err != nil {
+			publishSpan.SetStatus(codes.Error, "task dispatch encoding failed")
+			publishSpan.End()
 			return brokerOperationError("encode task", run.id, broker.MessageID(attemptID), err)
 		}
 		message := broker.TaskMessage{
-			ID:    broker.MessageID(attemptID),
-			Topic: taskTopic(run.id),
-			Body:  body,
+			ID:      broker.MessageID(attemptID),
+			Topic:   taskTopic(run.id),
+			Body:    body,
+			Headers: make(map[string]string),
 		}
-		if err := engine.config.taskBroker.Publish(ctx, message); err != nil {
+		engine.config.instrumentation.Propagator().Inject(
+			publishContext,
+			propagation.MapCarrier(message.Headers),
+		)
+		if err := engine.config.taskBroker.Publish(publishContext, message); err != nil {
+			publishSpan.SetStatus(codes.Error, "task publication failed")
+			publishSpan.End()
 			return brokerOperationError("publish task", run.id, message.ID, err)
 		}
+		publishSpan.End()
 		published[attemptID] = struct{}{}
+		engine.config.instrumentation.Metrics().QueuePublished()
 	}
 	return nil
 }
@@ -571,7 +616,10 @@ func executeBrokerWorker(
 	clock Clock,
 	heartbeatInterval time.Duration,
 	identity workerIdentity,
+	runID RunID,
+	workflowID workflow.WorkflowID,
 	taskBroker broker.Broker,
+	instrumentation *observability.Instrumentation,
 	subscription broker.Subscription,
 	claims chan<- workerClaimEvent,
 	heartbeats chan<- workerHeartbeatEvent,
@@ -581,6 +629,26 @@ func executeBrokerWorker(
 	workers *sync.WaitGroup,
 ) {
 	defer workers.Done()
+	instrumentation.Metrics().WorkerStarted()
+	instrumentation.Log(
+		ctx,
+		slog.LevelInfo,
+		"worker started",
+		"workflow_id", workflowID,
+		"workflow_run_id", runID,
+		"worker_id", identity.workerID,
+	)
+	defer func() {
+		instrumentation.Metrics().WorkerStopped()
+		instrumentation.Log(
+			ctx,
+			slog.LevelInfo,
+			"worker stopped",
+			"workflow_id", workflowID,
+			"workflow_run_id", runID,
+			"worker_id", identity.workerID,
+		)
+	}()
 
 	heartbeatContext, cancelHeartbeat := context.WithCancel(ctx)
 	var heartbeatGroup sync.WaitGroup
@@ -598,8 +666,24 @@ func executeBrokerWorker(
 	}
 
 	for {
-		delivery, err := taskBroker.Receive(ctx, subscription)
+		receiveContext, receiveSpan := instrumentation.Tracer("forgeflow/execution").Start(
+			ctx,
+			"forgeflow.broker.receive",
+			trace.WithSpanKind(trace.SpanKindConsumer),
+			trace.WithAttributes(
+				attribute.String("messaging.system", "forgeflow"),
+				attribute.String("messaging.destination.name", string(subscription.Topic)),
+				attribute.String("forgeflow.workflow.id", string(workflowID)),
+				attribute.String("forgeflow.workflow_run.id", string(runID)),
+				attribute.String("forgeflow.worker.id", string(identity.workerID)),
+			),
+		)
+		delivery, err := taskBroker.Receive(receiveContext, subscription)
 		if err != nil {
+			if ctx.Err() == nil && !errors.Is(err, context.Canceled) {
+				receiveSpan.SetStatus(codes.Error, "task receipt failed")
+			}
+			receiveSpan.End()
 			if ctx.Err() != nil || errors.Is(err, context.Canceled) {
 				return
 			}
@@ -609,6 +693,11 @@ func executeBrokerWorker(
 			}
 			return
 		}
+		receiveSpan.SetAttributes(
+			attribute.String("messaging.message.id", string(delivery.Message().ID)),
+			attribute.Int64("messaging.message.delivery_count", int64(delivery.DeliveryCount())),
+		)
+		receiveSpan.End()
 
 		response := make(chan workerClaimResponse, 1)
 		claim := workerClaimEvent{
@@ -635,7 +724,24 @@ func executeBrokerWorker(
 			continue
 		}
 
-		output, err := invokeHandler(ctx, *assignment.job)
+		taskContext, taskSpan := instrumentation.Tracer("forgeflow/execution").Start(
+			assignment.job.context,
+			"forgeflow.worker.execute",
+			trace.WithSpanKind(trace.SpanKindConsumer),
+			trace.WithAttributes(
+				attribute.String("forgeflow.workflow.id", string(workflowID)),
+				attribute.String("forgeflow.workflow_run.id", string(runID)),
+				attribute.String("forgeflow.task.id", string(assignment.job.request.Task.ID)),
+				attribute.String("forgeflow.task_run.id", string(assignment.job.request.TaskRunID)),
+				attribute.String("forgeflow.attempt.id", string(assignment.job.request.AttemptID)),
+				attribute.String("forgeflow.worker.id", string(identity.workerID)),
+			),
+		)
+		output, err := invokeHandler(taskContext, *assignment.job)
+		if err != nil {
+			taskSpan.SetStatus(codes.Error, "task execution failed")
+		}
+		taskSpan.End()
 		if errors.Is(err, errWorkerDisappeared) {
 			nackWorkerDelivery(delivery)
 			cancelHeartbeat()
@@ -651,6 +757,7 @@ func executeBrokerWorker(
 			nackWorkerDelivery(delivery)
 			return
 		case results <- brokerTaskResult{
+			context:   taskContext,
 			taskID:    assignment.job.request.Task.ID,
 			taskRunID: assignment.job.request.TaskRunID,
 			workerID:  identity.workerID,

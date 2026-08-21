@@ -10,6 +10,9 @@ import (
 
 	"github.com/vijaypratap3364/forgeflow/internal/broker"
 	"github.com/vijaypratap3364/forgeflow/internal/workflow"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Engine executes workflows with identified in-process workers and durable
@@ -82,10 +85,25 @@ func (engine *Engine) Execute(
 	ctx context.Context,
 	runID RunID,
 	definition workflow.WorkflowDefinition,
-) (*WorkflowRun, error) {
+) (result *WorkflowRun, resultErr error) {
 	if ctx == nil {
 		return nil, errors.New("execute workflow: context is nil")
 	}
+	ctx, schedulerSpan := engine.config.instrumentation.Tracer("forgeflow/execution").Start(
+		ctx,
+		"forgeflow.scheduler.execute",
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(
+			attribute.String("forgeflow.workflow.id", string(definition.ID)),
+			attribute.String("forgeflow.workflow_run.id", string(runID)),
+		),
+	)
+	defer func() {
+		if resultErr != nil {
+			schedulerSpan.SetStatus(codes.Error, "workflow execution failed")
+		}
+		schedulerSpan.End()
+	}()
 
 	run, err := newWorkflowRun(runID, definition, engine.config.clock.Now)
 	if err != nil {
@@ -124,13 +142,25 @@ func (engine *Engine) Execute(
 // Recover reconstructs a persisted workflow run. Terminal runs are returned
 // unchanged. A valid lease is allowed to expire rather than being stolen; an
 // expired or legacy lease is recovered according to the task retry policy.
-func (engine *Engine) Recover(ctx context.Context, runID RunID) (*WorkflowRun, error) {
+func (engine *Engine) Recover(ctx context.Context, runID RunID) (result *WorkflowRun, resultErr error) {
 	if ctx == nil {
 		return nil, errors.New("recover workflow: context is nil")
 	}
 	if !validRunID(string(runID)) {
 		return nil, &InvalidRunIDError{RunID: runID}
 	}
+	ctx, schedulerSpan := engine.config.instrumentation.Tracer("forgeflow/execution").Start(
+		ctx,
+		"forgeflow.scheduler.recover",
+		trace.WithSpanKind(trace.SpanKindInternal),
+		trace.WithAttributes(attribute.String("forgeflow.workflow_run.id", string(runID))),
+	)
+	defer func() {
+		if resultErr != nil {
+			schedulerSpan.SetStatus(codes.Error, "workflow recovery failed")
+		}
+		schedulerSpan.End()
+	}()
 
 	snapshot, found, err := engine.store.LoadRun(ctx, runID)
 	if err != nil {
@@ -146,6 +176,7 @@ func (engine *Engine) Recover(ctx context.Context, runID RunID) (*WorkflowRun, e
 	if !found {
 		return nil, &WorkflowNotFoundError{WorkflowID: snapshot.WorkflowID}
 	}
+	schedulerSpan.SetAttributes(attribute.String("forgeflow.workflow.id", string(snapshot.WorkflowID)))
 	run, err := restoreWorkflowRun(snapshot, definition, engine.config.clock.Now)
 	if err != nil {
 		return nil, fmt.Errorf("restore workflow run %q: %w", runID, err)
@@ -420,6 +451,7 @@ func sortTasks(tasks []workflow.TaskDefinition) {
 }
 
 type taskJob struct {
+	context context.Context
 	request TaskRequest
 	handler TaskHandler
 }

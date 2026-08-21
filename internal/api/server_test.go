@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/vijaypratap3364/forgeflow/internal/execution"
+	"github.com/vijaypratap3364/forgeflow/internal/observability"
 	"github.com/vijaypratap3364/forgeflow/internal/persistence"
 	"github.com/vijaypratap3364/forgeflow/internal/security"
 )
@@ -453,6 +454,20 @@ func newTestServer(
 	t *testing.T,
 	configure func(*execution.HandlerRegistry),
 ) *Server {
+	return newObservedTestServer(
+		t,
+		configure,
+		observability.NewNoopInstrumentation(),
+		nil,
+	)
+}
+
+func newObservedTestServer(
+	t *testing.T,
+	configure func(*execution.HandlerRegistry),
+	instrumentation *observability.Instrumentation,
+	dependencyCheck DependencyCheck,
+) *Server {
 	t.Helper()
 	store, err := persistence.OpenFileStore(t.TempDir() + "/forgeflow.ffdb")
 	if err != nil {
@@ -478,11 +493,11 @@ func newTestServer(
 	if err != nil {
 		t.Fatalf("NewFixedWindowRateLimiter() error = %v", err)
 	}
-	server, err := NewServer(store, registry, 2, staticAuthenticator{principal: security.Principal{
+	server, err := NewInstrumentedServer(store, registry, 2, staticAuthenticator{principal: security.Principal{
 		UserID: user.ID, DisplayName: user.DisplayName,
-	}}, limiter)
+	}}, limiter, instrumentation, dependencyCheck)
 	if err != nil {
-		t.Fatalf("NewServer() error = %v", err)
+		t.Fatalf("NewInstrumentedServer() error = %v", err)
 	}
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

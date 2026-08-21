@@ -183,7 +183,8 @@ func OpenNATSBroker(ctx context.Context, config NATSConfig) (*NATSBroker, error)
 
 // Publish durably stores message before returning. Repeated publication of a
 // MessageID is deduplicated by JetStream within the configured duplicate
-// window; persisted task state handles duplicates outside that window.
+// window; propagation headers do not change the stable JSON task body, and
+// persisted task state handles duplicates outside that window.
 func (b *NATSBroker) Publish(ctx context.Context, message TaskMessage) error {
 	if ctx == nil {
 		return &ValidationError{Field: "context", Reason: "must not be nil"}
@@ -195,10 +196,14 @@ func (b *NATSBroker) Publish(ctx context.Context, message TaskMessage) error {
 		return err
 	}
 
-	_, err := b.jetStream.Publish(
+	natsMessage := nats.NewMsg(b.subject(message.Topic))
+	natsMessage.Data = append([]byte(nil), message.Body...)
+	for name, value := range message.Headers {
+		natsMessage.Header.Set(name, value)
+	}
+	_, err := b.jetStream.PublishMsg(
 		ctx,
-		b.subject(message.Topic),
-		append([]byte(nil), message.Body...),
+		natsMessage,
 		jetstream.WithMsgID(string(message.ID)),
 		jetstream.WithExpectStream(b.config.StreamName),
 	)
@@ -241,15 +246,46 @@ func (b *NATSBroker) Receive(ctx context.Context, subscription Subscription) (De
 	if err != nil {
 		return nil, fmt.Errorf("read task message metadata: %w", err)
 	}
+	headers := make(map[string]string)
+	for name := range message.Headers() {
+		if name == jetstream.MsgIDHeader {
+			continue
+		}
+		headers[strings.ToLower(name)] = message.Headers().Get(name)
+	}
+	if len(headers) == 0 {
+		headers = nil
+	}
 	return &natsDelivery{
 		message: TaskMessage{
-			ID:    MessageID(message.Headers().Get(jetstream.MsgIDHeader)),
-			Topic: subscription.Topic,
-			Body:  append([]byte(nil), message.Data()...),
+			ID:      MessageID(message.Headers().Get(jetstream.MsgIDHeader)),
+			Topic:   subscription.Topic,
+			Body:    append([]byte(nil), message.Data()...),
+			Headers: headers,
 		},
 		deliveryCount: metadata.NumDelivered,
 		messageHandle: message,
 	}, nil
+}
+
+// Ping verifies that the NATS connection can complete a protocol round trip.
+func (b *NATSBroker) Ping(ctx context.Context) error {
+	if ctx == nil {
+		return &ValidationError{Field: "context", Reason: "must not be nil"}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := b.ensureOpen(); err != nil {
+		return err
+	}
+	if !b.conn.IsConnected() {
+		return errors.New("NATS connection is not connected")
+	}
+	if err := b.conn.FlushWithContext(ctx); err != nil {
+		return fmt.Errorf("flush NATS readiness check: %w", err)
+	}
+	return nil
 }
 
 func (b *NATSBroker) consumer(ctx context.Context, subscription Subscription) (jetstream.Consumer, error) {
@@ -330,11 +366,7 @@ type natsDelivery struct {
 func (d *natsDelivery) Message() TaskMessage {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return TaskMessage{
-		ID:    d.message.ID,
-		Topic: d.message.Topic,
-		Body:  append([]byte(nil), d.message.Body...),
-	}
+	return cloneMessage(d.message)
 }
 
 func (d *natsDelivery) DeliveryCount() uint64 {
@@ -402,3 +434,6 @@ func (d *natsDelivery) Progress(ctx context.Context) error {
 	}
 	return nil
 }
+
+var _ Broker = (*NATSBroker)(nil)
+var _ ReadinessChecker = (*NATSBroker)(nil)

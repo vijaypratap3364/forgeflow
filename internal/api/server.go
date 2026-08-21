@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"mime"
 	"net/http"
 	"strconv"
@@ -19,28 +20,40 @@ import (
 	"unicode"
 
 	"github.com/vijaypratap3364/forgeflow/internal/execution"
+	"github.com/vijaypratap3364/forgeflow/internal/observability"
 	"github.com/vijaypratap3364/forgeflow/internal/security"
 	"github.com/vijaypratap3364/forgeflow/internal/workflow"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/trace"
 )
 
 const (
-	maxRequestBody = 1 << 20
-	sseKeepAlive   = 15 * time.Second
+	maxRequestBody   = 1 << 20
+	sseKeepAlive     = 15 * time.Second
+	readinessTimeout = 2 * time.Second
 )
 
 // Server owns the HTTP handler, asynchronous run lifecycle, and live event broker.
 type Server struct {
-	store          security.Store
-	executionStore execution.Store
-	auth           security.Authenticator
-	limiter        security.RateLimiter
-	registry       *execution.HandlerRegistry
-	manager        *runManager
-	broker         *eventBroker
-	mux            *http.ServeMux
-	workflowMu     sync.Mutex
-	ready          atomic.Bool
+	store           security.Store
+	executionStore  execution.Store
+	auth            security.Authenticator
+	limiter         security.RateLimiter
+	registry        *execution.HandlerRegistry
+	manager         *runManager
+	broker          *eventBroker
+	mux             *http.ServeMux
+	workflowMu      sync.Mutex
+	ready           atomic.Bool
+	instrumentation *observability.Instrumentation
+	dependencyCheck DependencyCheck
 }
+
+// DependencyCheck verifies whether the external dependencies needed to accept
+// work are currently usable.
+type DependencyCheck func(context.Context) error
 
 // NewServer creates an HTTP API around a Store and safe task-handler registry.
 func NewServer(
@@ -49,6 +62,30 @@ func NewServer(
 	workerCount int,
 	auth security.Authenticator,
 	limiter security.RateLimiter,
+	engineOptions ...execution.EngineOption,
+) (*Server, error) {
+	return NewInstrumentedServer(
+		store,
+		registry,
+		workerCount,
+		auth,
+		limiter,
+		observability.NewNoopInstrumentation(),
+		nil,
+		engineOptions...,
+	)
+}
+
+// NewInstrumentedServer creates an HTTP API with explicitly owned telemetry
+// and an optional dependency-readiness check.
+func NewInstrumentedServer(
+	store security.Store,
+	registry *execution.HandlerRegistry,
+	workerCount int,
+	auth security.Authenticator,
+	limiter security.RateLimiter,
+	instrumentation *observability.Instrumentation,
+	dependencyCheck DependencyCheck,
 	engineOptions ...execution.EngineOption,
 ) (*Server, error) {
 	if store == nil {
@@ -63,21 +100,31 @@ func NewServer(
 	if limiter == nil {
 		return nil, errors.New("create API server: rate limiter must not be nil")
 	}
+	if instrumentation == nil {
+		return nil, errors.New("create API server: instrumentation must not be nil")
+	}
 	broker := newEventBroker()
-	observed := &observedStore{delegate: store, observe: broker.observe}
+	observed := &observedStore{
+		delegate:        store,
+		observe:         broker.observe,
+		instrumentation: instrumentation,
+	}
+	engineOptions = append(engineOptions, execution.WithInstrumentation(instrumentation))
 	engine, err := execution.NewEngine(workerCount, registry, observed, engineOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("create API execution engine: %w", err)
 	}
 	server := &Server{
-		store:          store,
-		executionStore: observed,
-		auth:           auth,
-		limiter:        limiter,
-		registry:       registry,
-		manager:        newRunManager(engine),
-		broker:         broker,
-		mux:            http.NewServeMux(),
+		store:           store,
+		executionStore:  observed,
+		auth:            auth,
+		limiter:         limiter,
+		registry:        registry,
+		manager:         newRunManager(engine),
+		broker:          broker,
+		mux:             http.NewServeMux(),
+		instrumentation: instrumentation,
+		dependencyCheck: dependencyCheck,
 	}
 	server.routes()
 	server.ready.Store(true)
@@ -86,6 +133,65 @@ func NewServer(
 
 // ServeHTTP dispatches one ForgeFlow API request.
 func (server *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	requestID, err := observability.NewRequestID()
+	if err != nil {
+		writeAPIError(writer, http.StatusInternalServerError, "internal_error", "could not generate a request ID", "")
+		return
+	}
+	requestContext := server.instrumentation.Propagator().Extract(
+		request.Context(),
+		propagation.HeaderCarrier(request.Header),
+	)
+	requestContext = observability.WithRequestID(requestContext, requestID)
+	requestContext, requestSpan := server.instrumentation.Tracer("forgeflow/api").Start(
+		requestContext,
+		"forgeflow.http.request",
+		trace.WithSpanKind(trace.SpanKindServer),
+		trace.WithAttributes(
+			attribute.String("http.request.method", request.Method),
+			attribute.String("url.path", request.URL.Path),
+			attribute.String("forgeflow.request.id", requestID),
+		),
+	)
+	request = request.WithContext(requestContext)
+	writer.Header().Set("X-Request-ID", requestID)
+	observedWriter, responseWriter := observeResponse(writer)
+	startedAt := time.Now()
+	_, route := server.mux.Handler(request)
+	defer func() {
+		requestSpan.SetName(request.Method + " " + normalizedRoute(route))
+		requestSpan.SetAttributes(
+			attribute.String("http.route", normalizedRoute(route)),
+			attribute.Int("http.response.status_code", observedWriter.statusCode()),
+		)
+		if observedWriter.statusCode() >= http.StatusInternalServerError {
+			requestSpan.SetStatus(codes.Error, "HTTP server error")
+		}
+		server.instrumentation.Metrics().HTTPRequest(
+			request.Method,
+			normalizedRoute(route),
+			observedWriter.statusCode(),
+			time.Since(startedAt),
+		)
+		attributes := []any{
+			"method", request.Method,
+			"route", normalizedRoute(route),
+			"status", observedWriter.statusCode(),
+			"duration_ms", time.Since(startedAt).Milliseconds(),
+		}
+		if workflowID := routeValue(route, request.URL.Path, "id"); workflowID != "" {
+			attributes = append(attributes, "workflow_id", workflowID)
+		}
+		if runID := routeValue(route, request.URL.Path, "runID"); runID != "" {
+			attributes = append(attributes, "workflow_run_id", runID)
+		}
+		server.instrumentation.Log(request.Context(), slog.LevelInfo, "HTTP request completed", attributes...)
+		requestSpan.End()
+	}()
+	server.serveHTTP(responseWriter, request)
+}
+
+func (server *Server) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 	if strings.HasPrefix(request.URL.Path, "/api/v1/") || request.URL.Path == "/api/v1" {
 		principal, err := server.auth.Authenticate(request.Context(), bearerToken(request.Header.Get("Authorization")))
 		if err != nil {
@@ -130,6 +236,7 @@ func (server *Server) Shutdown(ctx context.Context) error {
 func (server *Server) routes() {
 	server.mux.HandleFunc("/healthz", server.handleHealth)
 	server.mux.HandleFunc("/readyz", server.handleReady)
+	server.mux.HandleFunc("/metrics", server.handleMetrics)
 	server.mux.HandleFunc("/api/v1/projects", server.handleProjects)
 	server.mux.HandleFunc("/api/v1/projects/{projectID}", server.handleProject)
 	server.mux.HandleFunc("/api/v1/projects/{projectID}/members", server.handleProjectMembers)
@@ -161,7 +268,37 @@ func (server *Server) handleReady(writer http.ResponseWriter, request *http.Requ
 		writeAPIError(writer, http.StatusServiceUnavailable, "not_ready", "ForgeFlow is shutting down", "")
 		return
 	}
+	if server.dependencyCheck != nil {
+		checkContext, cancelCheck := context.WithTimeout(request.Context(), readinessTimeout)
+		defer cancelCheck()
+		if err := server.dependencyCheck(checkContext); err != nil {
+			server.instrumentation.Log(
+				request.Context(),
+				slog.LevelWarn,
+				"readiness dependency check failed",
+			)
+			writeAPIError(
+				writer,
+				http.StatusServiceUnavailable,
+				"dependency_unavailable",
+				"one or more ForgeFlow dependencies are unavailable",
+				"",
+			)
+			return
+		}
+	}
 	writeJSON(writer, http.StatusOK, StatusResponse{Status: "ready"})
+}
+
+func (server *Server) handleMetrics(writer http.ResponseWriter, request *http.Request) {
+	if !requireMethod(writer, request, http.MethodGet) {
+		return
+	}
+	writer.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	writer.WriteHeader(http.StatusOK)
+	if err := server.instrumentation.Metrics().WritePrometheus(writer); err != nil {
+		server.instrumentation.Log(request.Context(), slog.LevelError, "write metrics response")
+	}
 }
 
 func (server *Server) handleWorkflows(writer http.ResponseWriter, request *http.Request) {
@@ -316,7 +453,7 @@ func (server *Server) handleWorkflowRuns(writer http.ResponseWriter, request *ht
 		writeStoreError(writer, err)
 		return
 	}
-	if err := server.manager.start(runID); err != nil {
+	if err := server.manager.start(request.Context(), runID); err != nil {
 		if errors.Is(err, errManagerClosed) {
 			writeAPIError(writer, http.StatusServiceUnavailable, "not_ready", "ForgeFlow is shutting down", "")
 			return
@@ -363,7 +500,7 @@ func (server *Server) handleRunCancellation(writer http.ResponseWriter, request 
 		return
 	}
 	if !server.manager.cancel(snapshot.ID) {
-		if err := server.manager.start(snapshot.ID); err != nil && !errors.Is(err, errRunAlreadyActive) {
+		if err := server.manager.start(request.Context(), snapshot.ID); err != nil && !errors.Is(err, errRunAlreadyActive) {
 			writeAPIError(writer, http.StatusServiceUnavailable, "not_ready", "workflow run cannot be canceled while ForgeFlow is shutting down", "")
 			return
 		}
@@ -424,7 +561,7 @@ func (server *Server) handleRunRetry(writer http.ResponseWriter, request *http.R
 		writeStoreError(writer, err)
 		return
 	}
-	if err := server.manager.start(runID); err != nil {
+	if err := server.manager.start(request.Context(), runID); err != nil {
 		writeAPIError(writer, http.StatusServiceUnavailable, "not_ready", "workflow retry cannot start", "")
 		return
 	}

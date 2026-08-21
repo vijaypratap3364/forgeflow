@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"github.com/vijaypratap3364/forgeflow/internal/api"
 	"github.com/vijaypratap3364/forgeflow/internal/broker"
 	"github.com/vijaypratap3364/forgeflow/internal/execution"
+	"github.com/vijaypratap3364/forgeflow/internal/observability"
 	"github.com/vijaypratap3364/forgeflow/internal/persistence"
 	"github.com/vijaypratap3364/forgeflow/internal/security"
 )
@@ -32,6 +34,9 @@ const (
 	defaultJWTLeeway       = 30 * time.Second
 	defaultRateLimit       = 120
 	defaultRateWindow      = time.Minute
+	defaultLogLevel        = "info"
+	defaultTraceExporter   = observability.TraceExporterNone
+	defaultServiceName     = "forgeflow"
 )
 
 // Config contains process settings for the ForgeFlow API server. PostgresDSN
@@ -53,6 +58,9 @@ type Config struct {
 	JWTLeeway         time.Duration
 	RateLimit         int
 	RateLimitWindow   time.Duration
+	LogLevel          string
+	TraceExporter     string
+	ServiceName       string
 }
 
 // DefaultConfig returns laptop-friendly local process defaults.
@@ -73,6 +81,9 @@ func DefaultConfig() Config {
 		JWTLeeway:         defaultJWTLeeway,
 		RateLimit:         defaultRateLimit,
 		RateLimitWindow:   defaultRateWindow,
+		LogLevel:          defaultLogLevel,
+		TraceExporter:     defaultTraceExporter,
+		ServiceName:       defaultServiceName,
 	}
 }
 
@@ -143,6 +154,15 @@ func ConfigFromEnv() (Config, error) {
 		}
 		config.RateLimitWindow = window
 	}
+	if value := strings.TrimSpace(os.Getenv("FORGEFLOW_LOG_LEVEL")); value != "" {
+		config.LogLevel = strings.ToLower(value)
+	}
+	if value := strings.TrimSpace(os.Getenv("FORGEFLOW_TRACE_EXPORTER")); value != "" {
+		config.TraceExporter = strings.ToLower(value)
+	}
+	if value := strings.TrimSpace(os.Getenv("FORGEFLOW_SERVICE_NAME")); value != "" {
+		config.ServiceName = value
+	}
 	if err := config.Validate(); err != nil {
 		return Config{}, err
 	}
@@ -195,11 +215,21 @@ func (config Config) Validate() error {
 	if config.RateLimit < 1 || config.RateLimitWindow <= 0 {
 		return errors.New("ForgeFlow rate limit and window must be positive")
 	}
+	var logLevel slog.Level
+	if err := logLevel.UnmarshalText([]byte(config.LogLevel)); err != nil {
+		return fmt.Errorf("ForgeFlow log level %q is invalid: %w", config.LogLevel, err)
+	}
+	if err := (observability.TraceConfig{
+		Exporter:    config.TraceExporter,
+		ServiceName: config.ServiceName,
+	}).Validate(); err != nil {
+		return fmt.Errorf("ForgeFlow tracing configuration: %w", err)
+	}
 	return nil
 }
 
 // Run starts the API server and gracefully stops it when ctx is canceled.
-func Run(ctx context.Context, config Config, output io.Writer) error {
+func Run(ctx context.Context, config Config, output io.Writer) (resultErr error) {
 	if ctx == nil {
 		return errors.New("run ForgeFlow: context must not be nil")
 	}
@@ -209,6 +239,41 @@ func Run(ctx context.Context, config Config, output io.Writer) error {
 	if err := config.Validate(); err != nil {
 		return fmt.Errorf("run ForgeFlow: %w", err)
 	}
+	defer func() {
+		resultErr = redactSensitiveError(
+			resultErr,
+			config.PostgresDSN,
+			config.NATSURL,
+			os.Getenv("OTEL_EXPORTER_OTLP_HEADERS"),
+		)
+	}()
+	var logLevel slog.Level
+	if err := logLevel.UnmarshalText([]byte(config.LogLevel)); err != nil {
+		return fmt.Errorf("run ForgeFlow: parse log level: %w", err)
+	}
+	logger := slog.New(slog.NewJSONHandler(output, &slog.HandlerOptions{Level: logLevel}))
+	tracerProvider, shutdownTracing, err := observability.OpenTracerProvider(
+		ctx,
+		observability.TraceConfig{
+			Exporter:    config.TraceExporter,
+			ServiceName: config.ServiceName,
+		},
+		output,
+	)
+	if err != nil {
+		return fmt.Errorf("run ForgeFlow: configure tracing: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), config.ShutdownTimeout)
+		defer cancelShutdown()
+		resultErr = errors.Join(resultErr, shutdownTracing(shutdownCtx))
+	}()
+	instrumentation := observability.NewInstrumentation(
+		logger,
+		observability.NewMetrics(),
+		tracerProvider,
+		nil,
+	)
 
 	store, closeStore, err := openStore(ctx, config)
 	if err != nil {
@@ -237,12 +302,14 @@ func Run(ctx context.Context, config Config, output io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("run ForgeFlow: configure API rate limit: %w", err)
 	}
-	apiServer, err := api.NewServer(
+	apiServer, err := api.NewInstrumentedServer(
 		store,
 		registry,
 		config.WorkerCount,
 		auth,
 		limiter,
+		instrumentation,
+		dependencyReadiness(store, taskBroker),
 		execution.WithBroker(taskBroker),
 	)
 	if err != nil {
@@ -264,6 +331,15 @@ func Run(ctx context.Context, config Config, output io.Writer) error {
 		}
 		return fmt.Errorf("run ForgeFlow: report listener: %w", err)
 	}
+	instrumentation.Log(
+		ctx,
+		slog.LevelInfo,
+		"ForgeFlow HTTP server started",
+		"address", listener.Addr().String(),
+		"store_backend", config.StoreBackend,
+		"broker_backend", config.BrokerBackend,
+		"worker_count", config.WorkerCount,
+	)
 
 	serveErrors := make(chan error, 1)
 	go func() {
@@ -297,6 +373,40 @@ func Run(ctx context.Context, config Config, output io.Writer) error {
 		}
 		return errors.Join(serviceErr, httpErr, serveErr)
 	}
+}
+
+type readinessPinger interface {
+	Ping(context.Context) error
+}
+
+func dependencyReadiness(store security.Store, taskBroker broker.Broker) api.DependencyCheck {
+	return func(ctx context.Context) error {
+		if pinger, ok := store.(readinessPinger); ok {
+			if err := pinger.Ping(ctx); err != nil {
+				return fmt.Errorf("persistence dependency is unavailable: %w", err)
+			}
+		}
+		if pinger, ok := taskBroker.(broker.ReadinessChecker); ok {
+			if err := pinger.Ping(ctx); err != nil {
+				return fmt.Errorf("task broker dependency is unavailable: %w", err)
+			}
+		}
+		return nil
+	}
+}
+
+func redactSensitiveError(err error, sensitiveValues ...string) error {
+	if err == nil {
+		return nil
+	}
+	message := err.Error()
+	for _, value := range sensitiveValues {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			message = strings.ReplaceAll(message, value, "[REDACTED]")
+		}
+	}
+	return errors.New(message)
 }
 
 func openBroker(ctx context.Context, config Config) (broker.Broker, func(), error) {

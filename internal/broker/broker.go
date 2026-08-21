@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"unicode"
 )
 
@@ -18,11 +19,14 @@ type Topic string
 // ConsumerID identifies a durable competing-consumer group.
 type ConsumerID string
 
-// TaskMessage is an implementation-neutral durable task envelope.
+// TaskMessage is an implementation-neutral durable task envelope. Headers are
+// lowercase propagation metadata and are not part of stable-ID content checks;
+// the first accepted publication supplies delivery metadata.
 type TaskMessage struct {
-	ID    MessageID
-	Topic Topic
-	Body  []byte
+	ID      MessageID
+	Topic   Topic
+	Body    []byte
+	Headers map[string]string
 }
 
 // Validate checks the transport-independent message invariants.
@@ -36,7 +40,31 @@ func (message TaskMessage) Validate() error {
 	if len(message.Body) == 0 {
 		return &ValidationError{Field: "body", Reason: "must not be empty"}
 	}
+	for name, value := range message.Headers {
+		if !validHeaderName(name) {
+			return &ValidationError{Field: "header name", Value: name}
+		}
+		if strings.ContainsAny(value, "\r\n") {
+			return &ValidationError{Field: "header value", Reason: "must not contain a line break"}
+		}
+	}
 	return nil
+}
+
+func validHeaderName(name string) bool {
+	if name == "" || name != strings.ToLower(name) {
+		return false
+	}
+	for index := 0; index < len(name); index++ {
+		character := name[index]
+		if (character >= 'a' && character <= 'z') ||
+			(character >= '0' && character <= '9') ||
+			strings.ContainsRune("!#$%&'*+-.^_`|~", rune(character)) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // Subscription selects a topic through one durable competing-consumer group.
@@ -73,6 +101,12 @@ type Delivery interface {
 type Broker interface {
 	Publish(context.Context, TaskMessage) error
 	Receive(context.Context, Subscription) (Delivery, error)
+}
+
+// ReadinessChecker is implemented by brokers that can verify their current
+// ability to serve scheduler and worker operations.
+type ReadinessChecker interface {
+	Ping(context.Context) error
 }
 
 // ErrClosed reports use of a broker after shutdown.
@@ -130,5 +164,11 @@ func validIdentifier(identifier string) bool {
 func cloneMessage(message TaskMessage) TaskMessage {
 	clone := message
 	clone.Body = append([]byte(nil), message.Body...)
+	if message.Headers != nil {
+		clone.Headers = make(map[string]string, len(message.Headers))
+		for name, value := range message.Headers {
+			clone.Headers[name] = value
+		}
+	}
 	return clone
 }

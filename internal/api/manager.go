@@ -16,27 +16,25 @@ var (
 type runManager struct {
 	engine *execution.Engine
 
-	mu         sync.Mutex
-	rootCtx    context.Context
-	cancelRoot context.CancelFunc
-	active     map[execution.RunID]context.CancelFunc
-	failures   map[execution.RunID]error
-	closed     bool
-	workers    sync.WaitGroup
+	mu       sync.Mutex
+	active   map[execution.RunID]context.CancelFunc
+	failures map[execution.RunID]error
+	closed   bool
+	workers  sync.WaitGroup
 }
 
 func newRunManager(engine *execution.Engine) *runManager {
-	rootCtx, cancelRoot := context.WithCancel(context.Background())
 	return &runManager{
-		engine:     engine,
-		rootCtx:    rootCtx,
-		cancelRoot: cancelRoot,
-		active:     make(map[execution.RunID]context.CancelFunc),
-		failures:   make(map[execution.RunID]error),
+		engine:   engine,
+		active:   make(map[execution.RunID]context.CancelFunc),
+		failures: make(map[execution.RunID]error),
 	}
 }
 
-func (manager *runManager) start(runID execution.RunID) error {
+func (manager *runManager) start(parent context.Context, runID execution.RunID) error {
+	if parent == nil {
+		return errors.New("start workflow run: context must not be nil")
+	}
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
 
@@ -46,7 +44,9 @@ func (manager *runManager) start(runID execution.RunID) error {
 	if _, exists := manager.active[runID]; exists {
 		return errRunAlreadyActive
 	}
-	runCtx, cancelRun := context.WithCancel(manager.rootCtx)
+	// Submission acceptance detaches client cancellation while preserving
+	// request IDs and trace context. The manager retains its own cancel handle.
+	runCtx, cancelRun := context.WithCancel(context.WithoutCancel(parent))
 	manager.active[runID] = cancelRun
 	manager.workers.Add(1)
 	go manager.recover(runCtx, runID)
@@ -89,7 +89,9 @@ func (manager *runManager) shutdown(ctx context.Context) error {
 	manager.mu.Lock()
 	if !manager.closed {
 		manager.closed = true
-		manager.cancelRoot()
+		for _, cancelRun := range manager.active {
+			cancelRun()
+		}
 	}
 	manager.mu.Unlock()
 

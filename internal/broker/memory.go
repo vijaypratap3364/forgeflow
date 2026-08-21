@@ -40,8 +40,8 @@ func NewInMemoryBroker() *InMemoryBroker {
 }
 
 // Publish stores a detached message and makes it available to every existing
-// durable subscription for its topic. Re-publishing identical content under
-// the same ID is idempotent.
+// durable subscription for its topic. Re-publishing identical logical content
+// under the same ID is idempotent; the first publication's headers are kept.
 func (broker *InMemoryBroker) Publish(ctx context.Context, message TaskMessage) error {
 	if err := contextError(ctx); err != nil {
 		return err
@@ -115,6 +115,19 @@ func (broker *InMemoryBroker) Receive(ctx context.Context, subscription Subscrip
 		case <-notify:
 		}
 	}
+}
+
+// Ping verifies that the process-local broker is still open.
+func (broker *InMemoryBroker) Ping(ctx context.Context) error {
+	if err := contextError(ctx); err != nil {
+		return err
+	}
+	broker.mu.Lock()
+	defer broker.mu.Unlock()
+	if broker.closed {
+		return ErrClosed
+	}
+	return nil
 }
 
 // Close releases blocked receivers. It is safe to call more than once.
@@ -239,3 +252,4 @@ func (delivery *memoryDelivery) Progress(ctx context.Context) error {
 }
 
 var _ Broker = (*InMemoryBroker)(nil)
+var _ ReadinessChecker = (*InMemoryBroker)(nil)

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/vijaypratap3364/forgeflow/internal/broker"
+	"github.com/vijaypratap3364/forgeflow/internal/observability"
 )
 
 const (
@@ -21,6 +22,19 @@ type engineConfig struct {
 	heartbeatInterval time.Duration
 	workerNamespace   string
 	taskBroker        broker.Broker
+	instrumentation   *observability.Instrumentation
+}
+
+// WithInstrumentation supplies explicitly owned logging, metrics, tracing,
+// and propagation dependencies to the scheduler and workers.
+func WithInstrumentation(instrumentation *observability.Instrumentation) EngineOption {
+	return func(config *engineConfig) error {
+		if instrumentation == nil {
+			return errors.New("instrumentation must not be nil")
+		}
+		config.instrumentation = instrumentation
+		return nil
+	}
 }
 
 // WithBroker supplies the durable task transport used by schedulers and
@@ -83,6 +97,7 @@ func defaultEngineConfig() (engineConfig, error) {
 		heartbeatInterval: defaultHeartbeatInterval,
 		workerNamespace:   "local-" + hex.EncodeToString(namespaceBytes),
 		taskBroker:        broker.NewInMemoryBroker(),
+		instrumentation:   observability.NewNoopInstrumentation(),
 	}, nil
 }
 
@@ -104,6 +119,9 @@ func (config engineConfig) validate() error {
 	}
 	if config.taskBroker == nil {
 		return errors.New("task broker must not be nil")
+	}
+	if config.instrumentation == nil {
+		return errors.New("instrumentation must not be nil")
 	}
 	return nil
 }

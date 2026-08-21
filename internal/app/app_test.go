@@ -7,10 +7,14 @@ import (
 	"crypto/rand"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/vijaypratap3364/forgeflow/internal/broker"
+	"github.com/vijaypratap3364/forgeflow/internal/persistence"
 )
 
 func TestConfigFromEnv(t *testing.T) {
@@ -31,6 +35,9 @@ func TestConfigFromEnv(t *testing.T) {
 	t.Setenv("FORGEFLOW_JWT_LEEWAY", "5s")
 	t.Setenv("FORGEFLOW_RATE_LIMIT", "25")
 	t.Setenv("FORGEFLOW_RATE_LIMIT_WINDOW", "30s")
+	t.Setenv("FORGEFLOW_LOG_LEVEL", "debug")
+	t.Setenv("FORGEFLOW_TRACE_EXPORTER", "stdout")
+	t.Setenv("FORGEFLOW_SERVICE_NAME", "forgeflow-test")
 
 	config, err := ConfigFromEnv()
 	if err != nil {
@@ -42,7 +49,8 @@ func TestConfigFromEnv(t *testing.T) {
 		config.NATSStreamName != "FORGEFLOW_TEST_TASKS" || config.NATSSubjectPrefix != "forgeflow.test.tasks" ||
 		config.WorkerCount != 2 || config.ShutdownTimeout != 3*time.Second || config.JWTPublicKeyPEM != strings.TrimSpace(publicKey) ||
 		config.JWTIssuer != "https://issuer.example" || config.JWTAudience != "forgeflow-test" ||
-		config.JWTLeeway != 5*time.Second || config.RateLimit != 25 || config.RateLimitWindow != 30*time.Second {
+		config.JWTLeeway != 5*time.Second || config.RateLimit != 25 || config.RateLimitWindow != 30*time.Second ||
+		config.LogLevel != "debug" || config.TraceExporter != "stdout" || config.ServiceName != "forgeflow-test" {
 		t.Fatalf("ConfigFromEnv() = %#v", config)
 	}
 }
@@ -91,6 +99,18 @@ func TestConfigValidateStoreRequirements(t *testing.T) {
 				config.JWTPublicKeyPEM = ""
 			},
 		},
+		{
+			name: "invalid log level",
+			mutate: func(config *Config) {
+				config.LogLevel = "verbose"
+			},
+		},
+		{
+			name: "invalid trace exporter",
+			mutate: func(config *Config) {
+				config.TraceExporter = "jaeger"
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -110,6 +130,43 @@ func TestConfigFromEnvRejectsInvalidWorkerCount(t *testing.T) {
 
 	if _, err := ConfigFromEnv(); err == nil {
 		t.Fatal("ConfigFromEnv() error = nil, want invalid worker count")
+	}
+}
+
+func TestRedactSensitiveErrorRemovesConfiguredSecrets(t *testing.T) {
+	t.Parallel()
+
+	err := errors.New("connect postgres://user:password@example.test/db with authorization=Bearer secret-token")
+	redacted := redactSensitiveError(
+		err,
+		"postgres://user:password@example.test/db",
+		"authorization=Bearer secret-token",
+	)
+	if strings.Contains(redacted.Error(), "password") || strings.Contains(redacted.Error(), "secret-token") {
+		t.Fatalf("redactSensitiveError() = %q", redacted)
+	}
+	if !strings.Contains(redacted.Error(), "[REDACTED]") {
+		t.Fatalf("redactSensitiveError() = %q, want redaction marker", redacted)
+	}
+}
+
+func TestDependencyReadinessChecksConfiguredBroker(t *testing.T) {
+	t.Parallel()
+
+	store, err := persistence.OpenFileStore(t.TempDir() + "/forgeflow.ffdb")
+	if err != nil {
+		t.Fatalf("OpenFileStore() error = %v", err)
+	}
+	taskBroker := broker.NewInMemoryBroker()
+	check := dependencyReadiness(store, taskBroker)
+	if err := check(context.Background()); err != nil {
+		t.Fatalf("dependencyReadiness() error = %v", err)
+	}
+	if err := taskBroker.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if err := check(context.Background()); !errors.Is(err, broker.ErrClosed) {
+		t.Fatalf("dependencyReadiness() error = %v, want ErrClosed", err)
 	}
 }
 
