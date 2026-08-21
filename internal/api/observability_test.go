@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -21,6 +20,10 @@ import (
 )
 
 func TestMetricsAndStructuredLogsDescribeWorkflowExecution(t *testing.T) {
+	const (
+		taskInputSecret  = "task-input-must-not-be-logged"
+		taskOutputSecret = "task-output-must-not-be-logged"
+	)
 	logOutput := &lockedBuffer{}
 	instrumentation := observability.NewInstrumentation(
 		slog.New(slog.NewJSONHandler(logOutput, nil)),
@@ -28,11 +31,17 @@ func TestMetricsAndStructuredLogsDescribeWorkflowExecution(t *testing.T) {
 		nil,
 		nil,
 	)
-	server := newObservedTestServer(t, nil, instrumentation, nil)
+	server := newObservedTestServer(t, func(registry *execution.HandlerRegistry) {
+		if err := registry.Register("sensitive-result", execution.TaskHandlerFunc(func(context.Context, execution.TaskRequest) (string, error) {
+			return taskOutputSecret, nil
+		})); err != nil {
+			t.Fatalf("Register() error = %v", err)
+		}
+	}, instrumentation, nil)
 
 	submitWorkflow(t, server, `{
 		"id":"observed-workflow",
-		"tasks":[{"id":"observed-task","name":"Observed task","handler":"noop"}]
+		"tasks":[{"id":"observed-task","name":"Observed task","handler":"sensitive-result","input":"task-input-must-not-be-logged"}]
 	}`)
 	created := request(
 		t,
@@ -72,6 +81,35 @@ func TestMetricsAndStructuredLogsDescribeWorkflowExecution(t *testing.T) {
 			t.Errorf("metrics response does not contain %q\n%s", sample, metrics)
 		}
 	}
+	for _, unboundedValue := range []string{
+		"observed-workflow",
+		"observed-run",
+		"observed-task",
+		string(execution.TaskRunIDFor("observed-run", "observed-task")),
+		runRequestID,
+	} {
+		if strings.Contains(metrics, unboundedValue) {
+			t.Errorf("metrics contain unbounded resource value %q\n%s", unboundedValue, metrics)
+		}
+	}
+	for _, forbiddenLabel := range []string{
+		"project_id=",
+		"user_id=",
+		"workflow_id=",
+		"workflow_run_id=",
+		"run_id=",
+		"task_id=",
+		"task_run_id=",
+		"attempt_id=",
+		"worker_id=",
+		"request_id=",
+		"trace_id=",
+		"span_id=",
+	} {
+		if strings.Contains(metrics, forbiddenLabel) {
+			t.Errorf("metrics contain forbidden unbounded label %q\n%s", forbiddenLabel, metrics)
+		}
+	}
 
 	logs := logOutput.String()
 	for _, fragment := range []string{
@@ -90,8 +128,10 @@ func TestMetricsAndStructuredLogsDescribeWorkflowExecution(t *testing.T) {
 			t.Errorf("structured logs do not contain %q\n%s", fragment, logs)
 		}
 	}
-	if strings.Contains(logs, "test-token") || strings.Contains(logs, "Authorization") {
-		t.Fatalf("structured logs contain authentication material: %s", logs)
+	for _, sensitiveValue := range []string{"test-token", "Authorization", taskInputSecret, taskOutputSecret} {
+		if strings.Contains(logs, sensitiveValue) {
+			t.Fatalf("structured logs contain sensitive value %q: %s", sensitiveValue, logs)
+		}
 	}
 }
 
@@ -170,8 +210,9 @@ func TestTraceContextConnectsHTTPToSchedulerBrokerWorkerAndPersistence(t *testin
 			t.Errorf("TracerProvider.Shutdown() error = %v", err)
 		}
 	})
+	logOutput := &lockedBuffer{}
 	instrumentation := observability.NewInstrumentation(
-		slog.New(slog.NewJSONHandler(io.Discard, nil)),
+		slog.New(slog.NewJSONHandler(logOutput, nil)),
 		observability.NewMetrics(),
 		provider,
 		nil,
@@ -217,6 +258,8 @@ func TestTraceContextConnectsHTTPToSchedulerBrokerWorkerAndPersistence(t *testin
 		"POST /api/v1/workflows/{id}/runs",
 		"forgeflow.scheduler.recover",
 		"forgeflow.persistence.create_run",
+		"forgeflow.persistence.load_run",
+		"forgeflow.persistence.load_workflow",
 		"forgeflow.persistence.save_run",
 		"forgeflow.broker.publish",
 		"forgeflow.broker.receive",
@@ -233,7 +276,21 @@ func TestTraceContextConnectsHTTPToSchedulerBrokerWorkerAndPersistence(t *testin
 	if httpSpan.Parent.SpanID() != wantParentID || !httpSpan.Parent.IsRemote() {
 		t.Fatalf("HTTP span parent = %s remote=%t, want %s remote", httpSpan.Parent.SpanID(), httpSpan.Parent.IsRemote(), wantParentID)
 	}
+	for _, childName := range []string{"forgeflow.scheduler.recover", "forgeflow.persistence.create_run"} {
+		childSpan, found := spans[childName]
+		if found && childSpan.Parent.SpanID() != httpSpan.SpanContext.SpanID() {
+			t.Errorf("%s parent = %s, want HTTP span %s", childName, childSpan.Parent.SpanID(), httpSpan.SpanContext.SpanID())
+		}
+	}
+	schedulerSpan, schedulerFound := spans["forgeflow.scheduler.recover"]
 	publishSpan, publishFound := spans["forgeflow.broker.publish"]
+	receiveSpan, receiveFound := spans["forgeflow.broker.receive"]
+	if schedulerFound && publishFound && publishSpan.Parent.SpanID() != schedulerSpan.SpanContext.SpanID() {
+		t.Errorf("broker publish span parent = %s, want scheduler span %s", publishSpan.Parent.SpanID(), schedulerSpan.SpanContext.SpanID())
+	}
+	if schedulerFound && receiveFound && receiveSpan.Parent.SpanID() != schedulerSpan.SpanContext.SpanID() {
+		t.Errorf("broker receive span parent = %s, want scheduler span %s", receiveSpan.Parent.SpanID(), schedulerSpan.SpanContext.SpanID())
+	}
 	workerSpan, workerFound := spans["forgeflow.worker.execute"]
 	if publishFound && workerFound && workerSpan.Parent.SpanID() != publishSpan.SpanContext.SpanID() {
 		t.Fatalf("worker span parent = %s, want broker publish span %s", workerSpan.Parent.SpanID(), publishSpan.SpanContext.SpanID())
@@ -248,6 +305,16 @@ func TestTraceContextConnectsHTTPToSchedulerBrokerWorkerAndPersistence(t *testin
 		}
 		if !persistenceChildFound {
 			t.Fatal("trace has no completion persistence span parented by worker execution")
+		}
+	}
+	logs := logOutput.String()
+	for _, fragment := range []string{
+		`"trace_id":"` + wantTraceID.String() + `"`,
+		`"span_id":"`,
+		`"workflow_run_id":"traced-run"`,
+	} {
+		if !strings.Contains(logs, fragment) {
+			t.Errorf("trace-correlated logs do not contain %q\n%s", fragment, logs)
 		}
 	}
 }

@@ -17,7 +17,9 @@ func TestMetricsExposeCountersGaugesAndHistograms(t *testing.T) {
 	metrics.WorkflowCompleted("canceled", time.Second)
 	metrics.WorkerStarted()
 	metrics.WorkerStopped()
+	metrics.WorkerStopped()
 	metrics.QueuePublished()
+	metrics.QueueClaimed()
 	metrics.QueueClaimed()
 	metrics.TaskStarted()
 	metrics.TaskCompleted("succeeded", 25*time.Millisecond)
@@ -32,6 +34,7 @@ func TestMetricsExposeCountersGaugesAndHistograms(t *testing.T) {
 		t.Fatalf("WritePrometheus() error = %v", err)
 	}
 	for _, sample := range []string{
+		"# TYPE forgeflow_workflows_submitted_total counter",
 		"forgeflow_workflows_submitted_total 1",
 		"forgeflow_workflows_succeeded_total 1",
 		"forgeflow_workflows_failed_total 1",
@@ -40,11 +43,15 @@ func TestMetricsExposeCountersGaugesAndHistograms(t *testing.T) {
 		`forgeflow_tasks_executed_total{status="succeeded"} 1`,
 		"forgeflow_task_failures_total 2",
 		"forgeflow_task_retries_total 1",
+		"# TYPE forgeflow_active_workers gauge",
 		"forgeflow_active_workers 0",
 		"forgeflow_queue_depth 0",
 		"forgeflow_running_tasks 0",
+		"# TYPE forgeflow_task_duration_seconds histogram",
 		"forgeflow_task_duration_seconds_count 3",
+		"forgeflow_task_duration_seconds_bucket{le=\"+Inf\"} 3",
 		"forgeflow_workflow_duration_seconds_count 3",
+		"forgeflow_http_request_duration_seconds_count 1",
 		`forgeflow_http_requests_total{method="GET",route="/healthz",status="200"} 1`,
 	} {
 		if !strings.Contains(output.String(), sample) {
