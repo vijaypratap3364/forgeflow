@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vijaypratap3364/forgeflow/internal/broker"
 	"github.com/vijaypratap3364/forgeflow/internal/workflow"
 )
 
@@ -117,7 +118,7 @@ func (engine *Engine) Execute(
 	if err := engine.saveRun(durabilityContext, run, "start workflow run"); err != nil {
 		return run, err
 	}
-	return engine.executeActiveRun(ctx, durabilityContext, run, resolvedHandlers)
+	return engine.executeBrokerRun(ctx, durabilityContext, run, resolvedHandlers)
 }
 
 // Recover reconstructs a persisted workflow run. Terminal runs are returned
@@ -181,7 +182,7 @@ func (engine *Engine) Recover(ctx context.Context, runID RunID) (*WorkflowRun, e
 	if err != nil {
 		return run, err
 	}
-	return engine.executeActiveRun(ctx, durabilityContext, run, resolvedHandlers)
+	return engine.executeBrokerRun(ctx, durabilityContext, run, resolvedHandlers)
 }
 
 func recoveredTerminalTaskState(run *WorkflowRun) (WorkflowRunStatus, error) {
@@ -203,14 +204,12 @@ func recoveredTerminalTaskState(run *WorkflowRun) (WorkflowRunStatus, error) {
 type localWorker struct {
 	id     WorkerID
 	slot   int
-	jobs   chan taskJob
 	cancel context.CancelFunc
 }
 
-type workerAvailable struct {
+type workerIdentity struct {
 	workerID WorkerID
 	slot     int
-	jobs     chan taskJob
 }
 
 type workerHeartbeatEvent struct {
@@ -222,337 +221,21 @@ type workerLostEvent struct {
 	slot     int
 }
 
-func (engine *Engine) executeActiveRun(
-	ctx context.Context,
-	durabilityContext context.Context,
-	run *WorkflowRun,
-	resolvedHandlers map[workflow.TaskID]TaskHandler,
-) (*WorkflowRun, error) {
-	definition := run.definition
-	definitions := taskDefinitionsByID(definition)
-	completed := completedTaskIDs(run)
-	ready := make(map[workflow.TaskID]workflow.TaskDefinition)
-	for _, task := range existingReadyTasks(run, definition) {
-		ready[task.ID] = task
-	}
-	newReady, err := markNewReady(run, definition, completed)
-	if err != nil {
-		return engine.failRun(durabilityContext, run, fmt.Errorf("prepare workflow run: %w", err))
-	}
-	for _, task := range newReady {
-		ready[task.ID] = task
-	}
-	if len(newReady) > 0 {
-		if err := engine.saveRun(durabilityContext, run, "make dependency-ready tasks schedulable"); err != nil {
-			return engine.failRun(durabilityContext, run, err)
-		}
-	}
+type workerClaimEvent struct {
+	workerID WorkerID
+	slot     int
+	delivery broker.Delivery
+	response chan workerClaimResponse
+}
 
-	runContext, cancelRunWorkers := context.WithCancel(ctx)
-	availableEvents := make(chan workerAvailable, engine.workerCount*2)
-	heartbeatEvents := make(chan workerHeartbeatEvent, engine.workerCount*2)
-	resultEvents := make(chan taskResult, engine.workerCount*2)
-	lostEvents := make(chan workerLostEvent, engine.workerCount*2)
+type workerClaimResponse struct {
+	job *taskJob
+}
 
-	var workerGroup sync.WaitGroup
-	workers := make(map[WorkerID]*localWorker)
-	currentBySlot := make(map[int]WorkerID)
-	generations := make(map[int]int)
-	available := make(map[WorkerID]workerAvailable)
-
-	spawnWorker := func(slot int) {
-		generations[slot]++
-		workerID := WorkerID(fmt.Sprintf(
-			"%s/%s/slot-%d/generation-%d",
-			engine.config.workerNamespace,
-			run.id,
-			slot,
-			generations[slot],
-		))
-		workerContext, cancelWorker := context.WithCancel(runContext)
-		worker := &localWorker{
-			id:     workerID,
-			slot:   slot,
-			jobs:   make(chan taskJob, 1),
-			cancel: cancelWorker,
-		}
-		workers[workerID] = worker
-		currentBySlot[slot] = workerID
-		workerGroup.Add(1)
-		go executeWorker(
-			workerContext,
-			engine.config.clock,
-			engine.config.heartbeatInterval,
-			workerAvailable{workerID: workerID, slot: slot, jobs: worker.jobs},
-			availableEvents,
-			heartbeatEvents,
-			resultEvents,
-			lostEvents,
-			&workerGroup,
-		)
-	}
-
-	for slot := 1; slot <= engine.workerCount; slot++ {
-		spawnWorker(slot)
-	}
-	shutdownWorkers := func() {
-		cancelRunWorkers()
-		for _, worker := range workers {
-			worker.cancel()
-		}
-		workerGroup.Wait()
-	}
-
-	inFlight := make(map[AttemptID]struct{})
-	for _, task := range run.Tasks() {
-		if task.Status == TaskRunRunning && task.CurrentAttemptID != "" {
-			inFlight[task.CurrentAttemptID] = struct{}{}
-		}
-	}
-
-	replaceWorker := func(workerID WorkerID) {
-		worker, exists := workers[workerID]
-		if !exists || currentBySlot[worker.slot] != workerID {
-			return
-		}
-		worker.cancel()
-		delete(available, workerID)
-		delete(workers, workerID)
-		delete(currentBySlot, worker.slot)
-		spawnWorker(worker.slot)
-	}
-
-	for {
-		recoveries := run.recoverExpiredLeases()
-		promoted := run.promoteDueRetries()
-		var leaseFailure *TaskExecutionError
-		for _, recovery := range recoveries {
-			delete(inFlight, recovery.AttemptID)
-			if recovery.WorkerID != "" {
-				replaceWorker(recovery.WorkerID)
-			}
-			if recovery.Outcome == CompletionRetryScheduled {
-				task := requireDefinition(definitions, recovery.TaskID)
-				if current, exists := run.Task(recovery.TaskID); exists && current.Status == TaskRunReady {
-					ready[task.ID] = task
-				}
-				continue
-			}
-			leaseFailure = &TaskExecutionError{
-				RunID:  run.id,
-				TaskID: recovery.TaskID,
-				Cause: &LeaseExpiredError{
-					RunID:     run.id,
-					TaskID:    recovery.TaskID,
-					AttemptID: recovery.AttemptID,
-				},
-			}
-		}
-		for _, taskID := range promoted {
-			ready[taskID] = requireDefinition(definitions, taskID)
-		}
-		if len(recoveries) > 0 || len(promoted) > 0 {
-			if err := engine.saveRun(durabilityContext, run, "recover expired leases and due retries"); err != nil {
-				shutdownWorkers()
-				return engine.failRun(durabilityContext, run, err)
-			}
-		}
-		if leaseFailure != nil {
-			shutdownWorkers()
-			return engine.failRun(durabilityContext, run, leaseFailure)
-		}
-
-		if len(completed) == len(definition.Tasks) {
-			shutdownWorkers()
-			if err := run.transitionWorkflow(WorkflowRunSucceeded); err != nil {
-				return engine.failRun(durabilityContext, run, fmt.Errorf("complete workflow run: %w", err))
-			}
-			if err := engine.saveRun(durabilityContext, run, "complete workflow run"); err != nil {
-				return run, err
-			}
-			return run, nil
-		}
-
-		if len(ready) > 0 && len(available) > 0 {
-			task := popReadyTask(ready)
-			workerSlot := popAvailableWorker(available)
-			attemptID, err := run.startTaskAttempt(task.ID, workerSlot.workerID, engine.config.leaseDuration)
-			if err != nil {
-				shutdownWorkers()
-				return engine.failRun(durabilityContext, run, fmt.Errorf("lease task to worker: %w", err))
-			}
-			if err := engine.saveRun(durabilityContext, run, "lease and dispatch task"); err != nil {
-				shutdownWorkers()
-				return engine.failRun(durabilityContext, run, err)
-			}
-			inFlight[attemptID] = struct{}{}
-			job := taskJob{
-				request: TaskRequest{
-					RunID:     run.id,
-					TaskRunID: TaskRunIDFor(run.id, task.ID),
-					AttemptID: attemptID,
-					Task:      cloneTaskDefinition(task),
-				},
-				handler: resolvedHandlers[task.ID],
-			}
-			select {
-			case workerSlot.jobs <- job:
-				continue
-			case <-ctx.Done():
-				shutdownWorkers()
-				return engine.cancelRun(durabilityContext, run, ctx.Err())
-			}
-		}
-
-		if len(ready) == 0 && len(inFlight) == 0 {
-			if _, waiting := run.nextReliabilityDeadline(); !waiting {
-				shutdownWorkers()
-				return engine.failRun(
-					durabilityContext,
-					run,
-					fmt.Errorf("workflow run %q stalled with unfinished tasks", run.id),
-				)
-			}
-		}
-
-		timer, timerChannel := engine.reliabilityTimer(run)
-		select {
-		case event := <-availableEvents:
-			if currentBySlot[event.slot] != event.workerID {
-				break
-			}
-			if err := run.recordWorkerHeartbeat(event.workerID, engine.config.leaseDuration); err != nil {
-				if timer != nil {
-					timer.Stop()
-				}
-				shutdownWorkers()
-				return engine.failRun(durabilityContext, run, fmt.Errorf("register worker: %w", err))
-			}
-			if err := engine.saveRun(durabilityContext, run, "register available worker"); err != nil {
-				if timer != nil {
-					timer.Stop()
-				}
-				shutdownWorkers()
-				return engine.failRun(durabilityContext, run, err)
-			}
-			available[event.workerID] = event
-
-		case event := <-heartbeatEvents:
-			worker, alive := workers[event.workerID]
-			if !alive || currentBySlot[worker.slot] != event.workerID {
-				break
-			}
-			if err := run.recordWorkerHeartbeat(event.workerID, engine.config.leaseDuration); err != nil {
-				if timer != nil {
-					timer.Stop()
-				}
-				shutdownWorkers()
-				return engine.failRun(durabilityContext, run, fmt.Errorf("record worker heartbeat: %w", err))
-			}
-			if err := engine.saveRun(durabilityContext, run, "record worker heartbeat"); err != nil {
-				if timer != nil {
-					timer.Stop()
-				}
-				shutdownWorkers()
-				return engine.failRun(durabilityContext, run, err)
-			}
-
-		case event := <-lostEvents:
-			if currentBySlot[event.slot] == event.workerID {
-				replaceWorker(event.workerID)
-			}
-
-		case result := <-resultEvents:
-			if contextErr := ctx.Err(); contextErr != nil {
-				if timer != nil {
-					timer.Stop()
-				}
-				shutdownWorkers()
-				return engine.cancelRun(durabilityContext, run, contextErr)
-			}
-			delete(inFlight, result.attemptID)
-			outcome, err := run.completeTaskAttempt(
-				result.taskID,
-				result.taskRunID,
-				result.workerID,
-				result.attemptID,
-				result.output,
-				result.err,
-			)
-			if err != nil {
-				if timer != nil {
-					timer.Stop()
-				}
-				shutdownWorkers()
-				return engine.failRun(durabilityContext, run, fmt.Errorf("record identified task completion: %w", err))
-			}
-			switch outcome {
-			case CompletionIgnored:
-				// Duplicate and stale completion events are deliberately no-ops.
-			case CompletionSucceeded:
-				completed[result.taskID] = struct{}{}
-				newReady, err := markNewReady(run, definition, completed)
-				if err != nil {
-					if timer != nil {
-						timer.Stop()
-					}
-					shutdownWorkers()
-					return engine.failRun(durabilityContext, run, fmt.Errorf("unlock dependent tasks: %w", err))
-				}
-				for _, task := range newReady {
-					ready[task.ID] = task
-				}
-				if err := engine.saveRun(durabilityContext, run, "record completion and unlock dependencies"); err != nil {
-					if timer != nil {
-						timer.Stop()
-					}
-					shutdownWorkers()
-					return engine.failRun(durabilityContext, run, err)
-				}
-			case CompletionRetryScheduled:
-				if task, exists := run.Task(result.taskID); exists && task.Status == TaskRunReady {
-					ready[result.taskID] = requireDefinition(definitions, result.taskID)
-				}
-				if err := engine.saveRun(durabilityContext, run, "schedule task retry"); err != nil {
-					if timer != nil {
-						timer.Stop()
-					}
-					shutdownWorkers()
-					return engine.failRun(durabilityContext, run, err)
-				}
-			case CompletionFailed:
-				if err := engine.saveRun(durabilityContext, run, "record terminal task failure"); err != nil {
-					if timer != nil {
-						timer.Stop()
-					}
-					shutdownWorkers()
-					return engine.failRun(durabilityContext, run, err)
-				}
-				if timer != nil {
-					timer.Stop()
-				}
-				shutdownWorkers()
-				return engine.failRun(durabilityContext, run, &TaskExecutionError{
-					RunID:  run.id,
-					TaskID: result.taskID,
-					Cause:  result.err,
-				})
-			}
-
-		case <-timerChannel:
-			// The loop applies due retries and expired leases against Clock.Now.
-
-		case <-ctx.Done():
-			if timer != nil {
-				timer.Stop()
-			}
-			shutdownWorkers()
-			return engine.cancelRun(durabilityContext, run, ctx.Err())
-		}
-		if timer != nil {
-			timer.Stop()
-		}
-	}
+type workerBrokerError struct {
+	workerID WorkerID
+	slot     int
+	err      error
 }
 
 func (engine *Engine) reliabilityTimer(run *WorkflowRun) (Timer, <-chan time.Time) {
@@ -730,17 +413,6 @@ func popReadyTask(ready map[workflow.TaskID]workflow.TaskDefinition) workflow.Ta
 	return task
 }
 
-func popAvailableWorker(available map[WorkerID]workerAvailable) workerAvailable {
-	workerIDs := make([]WorkerID, 0, len(available))
-	for workerID := range available {
-		workerIDs = append(workerIDs, workerID)
-	}
-	sort.Slice(workerIDs, func(left, right int) bool { return workerIDs[left] < workerIDs[right] })
-	worker := available[workerIDs[0]]
-	delete(available, worker.workerID)
-	return worker
-}
-
 func sortTasks(tasks []workflow.TaskDefinition) {
 	sort.Slice(tasks, func(left, right int) bool {
 		return tasks[left].ID < tasks[right].ID
@@ -752,77 +424,7 @@ type taskJob struct {
 	handler TaskHandler
 }
 
-type taskResult struct {
-	taskID    workflow.TaskID
-	taskRunID TaskRunID
-	workerID  WorkerID
-	attemptID AttemptID
-	output    string
-	err       error
-}
-
 var errWorkerDisappeared = errors.New("worker disappeared")
-
-func executeWorker(
-	ctx context.Context,
-	clock Clock,
-	heartbeatInterval time.Duration,
-	identity workerAvailable,
-	available chan<- workerAvailable,
-	heartbeats chan<- workerHeartbeatEvent,
-	results chan<- taskResult,
-	lost chan<- workerLostEvent,
-	workers *sync.WaitGroup,
-) {
-	defer workers.Done()
-
-	heartbeatContext, cancelHeartbeat := context.WithCancel(ctx)
-	var heartbeatGroup sync.WaitGroup
-	heartbeatGroup.Add(1)
-	go emitHeartbeats(heartbeatContext, clock, heartbeatInterval, identity.workerID, heartbeats, &heartbeatGroup)
-	defer func() {
-		cancelHeartbeat()
-		heartbeatGroup.Wait()
-	}()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case available <- identity:
-		}
-
-		var job taskJob
-		select {
-		case <-ctx.Done():
-			return
-		case job = <-identity.jobs:
-		}
-
-		output, err := invokeHandler(ctx, job)
-		if errors.Is(err, errWorkerDisappeared) {
-			cancelHeartbeat()
-			heartbeatGroup.Wait()
-			select {
-			case <-ctx.Done():
-			case lost <- workerLostEvent{workerID: identity.workerID, slot: identity.slot}:
-			}
-			return
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case results <- taskResult{
-			taskID:    job.request.Task.ID,
-			taskRunID: job.request.TaskRunID,
-			workerID:  identity.workerID,
-			attemptID: job.request.AttemptID,
-			output:    output,
-			err:       err,
-		}:
-		}
-	}
-}
 
 func emitHeartbeats(
 	ctx context.Context,

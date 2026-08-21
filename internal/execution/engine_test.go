@@ -329,6 +329,7 @@ func TestEngineRejectsInvalidConfigurationAndUnknownHandler(t *testing.T) {
 		WithLeaseTiming(0, time.Second),
 		WithLeaseTiming(time.Second, time.Second),
 		WithWorkerNamespace("bad namespace"),
+		WithBroker(nil),
 	}
 	for index, option := range invalidOptions {
 		_, err := NewEngine(1, NewHandlerRegistry(), newMemoryTestStore(), option)

@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/vijaypratap3364/forgeflow/internal/broker"
 )
 
 const (
@@ -18,6 +20,19 @@ type engineConfig struct {
 	leaseDuration     time.Duration
 	heartbeatInterval time.Duration
 	workerNamespace   string
+	taskBroker        broker.Broker
+}
+
+// WithBroker supplies the durable task transport used by schedulers and
+// workers. The caller retains ownership of the broker's lifecycle.
+func WithBroker(taskBroker broker.Broker) EngineOption {
+	return func(config *engineConfig) error {
+		if taskBroker == nil {
+			return errors.New("task broker must not be nil")
+		}
+		config.taskBroker = taskBroker
+		return nil
+	}
 }
 
 // EngineOption customizes reliability timing or worker identity.
@@ -67,6 +82,7 @@ func defaultEngineConfig() (engineConfig, error) {
 		leaseDuration:     defaultLeaseDuration,
 		heartbeatInterval: defaultHeartbeatInterval,
 		workerNamespace:   "local-" + hex.EncodeToString(namespaceBytes),
+		taskBroker:        broker.NewInMemoryBroker(),
 	}, nil
 }
 
@@ -85,6 +101,9 @@ func (config engineConfig) validate() error {
 	}
 	if !validIdentifier(config.workerNamespace) {
 		return errors.New("worker namespace is invalid")
+	}
+	if config.taskBroker == nil {
+		return errors.New("task broker must not be nil")
 	}
 	return nil
 }

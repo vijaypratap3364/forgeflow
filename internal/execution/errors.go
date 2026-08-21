@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/vijaypratap3364/forgeflow/internal/broker"
 	"github.com/vijaypratap3364/forgeflow/internal/workflow"
 )
 
@@ -206,6 +207,34 @@ type PersistenceError struct {
 	Operation string
 	RunID     RunID
 	Cause     error
+}
+
+// BrokerOperationError reports task transport failure without classifying the
+// workflow or task itself as failed. Durable state can be recovered later.
+type BrokerOperationError struct {
+	Operation string
+	RunID     RunID
+	MessageID broker.MessageID
+	Cause     error
+}
+
+// Error returns a contextual description of the failed broker operation.
+func (e *BrokerOperationError) Error() string {
+	if e.MessageID == "" {
+		return fmt.Sprintf("broker operation %q failed for workflow run %q: %v", e.Operation, e.RunID, e.Cause)
+	}
+	return fmt.Sprintf(
+		"broker operation %q failed for message %q in workflow run %q: %v",
+		e.Operation,
+		e.MessageID,
+		e.RunID,
+		e.Cause,
+	)
+}
+
+// Unwrap exposes the broker error for errors.Is and errors.As.
+func (e *BrokerOperationError) Unwrap() error {
+	return e.Cause
 }
 
 // Error returns a contextual description of the failed durable operation.
