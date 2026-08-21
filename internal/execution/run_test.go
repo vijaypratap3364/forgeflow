@@ -32,8 +32,8 @@ func TestNewWorkflowRunCreatesIndependentPendingState(t *testing.T) {
 	}
 
 	wantTasks := []TaskRun{
-		{TaskID: "a", Status: TaskRunPending},
-		{TaskID: "b", Status: TaskRunPending},
+		{TaskID: "a", Status: TaskRunPending, UpdatedAt: run.CreatedAt()},
+		{TaskID: "b", Status: TaskRunPending, UpdatedAt: run.CreatedAt()},
 	}
 	if got := run.Tasks(); !reflect.DeepEqual(got, wantTasks) {
 		t.Fatalf("Tasks() = %#v, want %#v", got, wantTasks)
@@ -182,6 +182,19 @@ func TestTaskRunLegalTransitions(t *testing.T) {
 			if task.Status != test.wantStatus || task.Output != test.wantOutput || task.Error != test.wantError {
 				t.Fatalf("Task() = %#v, want status=%q output=%q error=%q", task, test.wantStatus, test.wantOutput, test.wantError)
 			}
+			wantAttempts := 0
+			if slicesContainTransition(test.steps, TaskRunRunning) {
+				wantAttempts = 1
+			}
+			if task.AttemptCount != wantAttempts {
+				t.Fatalf("Task().AttemptCount = %d, want %d", task.AttemptCount, wantAttempts)
+			}
+			if task.UpdatedAt.IsZero() || task.FinishedAt.IsZero() {
+				t.Fatalf("Task() timestamps were not recorded: %#v", task)
+			}
+			if wantAttempts == 1 && task.StartedAt.IsZero() {
+				t.Fatalf("Task().StartedAt is zero after execution: %#v", task)
+			}
 		})
 	}
 }
@@ -315,6 +328,15 @@ type taskTransition struct {
 	target TaskRunStatus
 	output string
 	err    error
+}
+
+func slicesContainTransition(steps []taskTransition, target TaskRunStatus) bool {
+	for _, step := range steps {
+		if step.target == target {
+			return true
+		}
+	}
+	return false
 }
 
 func mustWorkflowRun(t *testing.T, definition workflow.WorkflowDefinition) *WorkflowRun {

@@ -5,6 +5,10 @@
 *.out
 coverage.*
 
+# ForgeFlow local persistence journals
+*.ffdb
+*.ffdb-*
+
 # Codex workspace scratch files
 /work/
 

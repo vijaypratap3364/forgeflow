@@ -82,6 +82,57 @@ func (e *InvalidRunIDError) Error() string {
 	return fmt.Sprintf("run ID %q is invalid: identifiers must be non-empty and contain no whitespace or control characters", e.RunID)
 }
 
+// SnapshotValidationError identifies malformed durable execution state.
+type SnapshotValidationError struct {
+	RunID  RunID
+	Reason string
+}
+
+// Error returns a contextual description of the malformed snapshot.
+func (e *SnapshotValidationError) Error() string {
+	return fmt.Sprintf("invalid snapshot for workflow run %q: %s", e.RunID, e.Reason)
+}
+
+// WorkflowConflictError reports an attempt to replace an immutable definition.
+type WorkflowConflictError struct {
+	WorkflowID workflow.WorkflowID
+}
+
+// Error returns a contextual description of the definition conflict.
+func (e *WorkflowConflictError) Error() string {
+	return fmt.Sprintf("workflow definition %q already exists with different content", e.WorkflowID)
+}
+
+// WorkflowNotFoundError reports a run referencing an unknown definition.
+type WorkflowNotFoundError struct {
+	WorkflowID workflow.WorkflowID
+}
+
+// Error returns a contextual description of the missing workflow.
+func (e *WorkflowNotFoundError) Error() string {
+	return fmt.Sprintf("workflow definition %q was not found", e.WorkflowID)
+}
+
+// RunAlreadyExistsError reports a duplicate workflow run ID.
+type RunAlreadyExistsError struct {
+	RunID RunID
+}
+
+// Error returns a contextual description of the duplicate run.
+func (e *RunAlreadyExistsError) Error() string {
+	return fmt.Sprintf("workflow run %q already exists", e.RunID)
+}
+
+// RunNotFoundError reports a mutation targeting an unknown workflow run.
+type RunNotFoundError struct {
+	RunID RunID
+}
+
+// Error returns a contextual description of the missing run.
+func (e *RunNotFoundError) Error() string {
+	return fmt.Sprintf("workflow run %q was not found", e.RunID)
+}
+
 // UnknownTaskRunError reports a task ID that is not part of an execution.
 type UnknownTaskRunError struct {
 	RunID  RunID

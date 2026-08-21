@@ -4,6 +4,7 @@ package execution
 import (
 	"sort"
 	"sync"
+	"time"
 	"unicode"
 
 	"github.com/vijaypratap3364/forgeflow/internal/workflow"
@@ -48,10 +49,14 @@ const (
 
 // TaskRun is an immutable snapshot of one task's execution state.
 type TaskRun struct {
-	TaskID workflow.TaskID
-	Status TaskRunStatus
-	Output string
-	Error  string
+	TaskID       workflow.TaskID
+	Status       TaskRunStatus
+	Output       string
+	Error        string
+	AttemptCount int
+	UpdatedAt    time.Time
+	StartedAt    time.Time
+	FinishedAt   time.Time
 }
 
 // WorkflowRun tracks the mutable state of one workflow execution. Its public
@@ -62,23 +67,39 @@ type WorkflowRun struct {
 	definition workflow.WorkflowDefinition
 	status     WorkflowRunStatus
 	tasks      map[workflow.TaskID]TaskRun
+	createdAt  time.Time
+	updatedAt  time.Time
+	now        func() time.Time
 }
 
 // NewWorkflowRun validates a definition and creates a pending execution instance.
 func NewWorkflowRun(runID RunID, definition workflow.WorkflowDefinition) (*WorkflowRun, error) {
+	return newWorkflowRun(runID, definition, time.Now)
+}
+
+func newWorkflowRun(
+	runID RunID,
+	definition workflow.WorkflowDefinition,
+	now func() time.Time,
+) (*WorkflowRun, error) {
 	if !validRunID(string(runID)) {
 		return nil, &InvalidRunIDError{RunID: runID}
 	}
 	if err := definition.Validate(); err != nil {
 		return nil, err
 	}
+	if now == nil {
+		now = time.Now
+	}
 
 	definition = cloneDefinition(definition)
+	createdAt := now().UTC()
 	tasks := make(map[workflow.TaskID]TaskRun, len(definition.Tasks))
 	for _, task := range definition.Tasks {
 		tasks[task.ID] = TaskRun{
-			TaskID: task.ID,
-			Status: TaskRunPending,
+			TaskID:    task.ID,
+			Status:    TaskRunPending,
+			UpdatedAt: createdAt,
 		}
 	}
 
@@ -87,6 +108,9 @@ func NewWorkflowRun(runID RunID, definition workflow.WorkflowDefinition) (*Workf
 		definition: definition,
 		status:     WorkflowRunPending,
 		tasks:      tasks,
+		createdAt:  createdAt,
+		updatedAt:  createdAt,
+		now:        now,
 	}, nil
 }
 
@@ -116,6 +140,22 @@ func (run *WorkflowRun) Status() WorkflowRunStatus {
 	return run.status
 }
 
+// CreatedAt returns the time the workflow run was created.
+func (run *WorkflowRun) CreatedAt() time.Time {
+	run.mu.RLock()
+	defer run.mu.RUnlock()
+
+	return run.createdAt
+}
+
+// UpdatedAt returns the time of the most recent state change.
+func (run *WorkflowRun) UpdatedAt() time.Time {
+	run.mu.RLock()
+	defer run.mu.RUnlock()
+
+	return run.updatedAt
+}
+
 // Task returns an immutable snapshot of one task run.
 func (run *WorkflowRun) Task(taskID workflow.TaskID) (TaskRun, bool) {
 	run.mu.RLock()
@@ -130,6 +170,10 @@ func (run *WorkflowRun) Tasks() []TaskRun {
 	run.mu.RLock()
 	defer run.mu.RUnlock()
 
+	return run.sortedTasksLocked()
+}
+
+func (run *WorkflowRun) sortedTasksLocked() []TaskRun {
 	tasks := make([]TaskRun, 0, len(run.tasks))
 	for _, task := range run.tasks {
 		tasks = append(tasks, task)
@@ -138,6 +182,21 @@ func (run *WorkflowRun) Tasks() []TaskRun {
 		return tasks[left].TaskID < tasks[right].TaskID
 	})
 	return tasks
+}
+
+// Snapshot returns a detached representation suitable for persistence.
+func (run *WorkflowRun) Snapshot() WorkflowRunSnapshot {
+	run.mu.RLock()
+	defer run.mu.RUnlock()
+
+	return WorkflowRunSnapshot{
+		ID:         run.id,
+		WorkflowID: run.definition.ID,
+		Status:     run.status,
+		CreatedAt:  run.createdAt,
+		UpdatedAt:  run.updatedAt,
+		Tasks:      run.sortedTasksLocked(),
+	}
 }
 
 func (run *WorkflowRun) taskStatus(taskID workflow.TaskID) (TaskRunStatus, error) {
@@ -173,16 +232,27 @@ func (run *WorkflowRun) transitionTask(
 		}
 	}
 
+	timestamp := run.nextTimestampLocked()
 	task.Status = target
 	task.Output = ""
 	task.Error = ""
+	task.UpdatedAt = timestamp
+	if target == TaskRunRunning {
+		task.AttemptCount++
+		task.StartedAt = timestamp
+		task.FinishedAt = time.Time{}
+	}
 	if target == TaskRunSucceeded {
 		task.Output = output
 	}
 	if (target == TaskRunFailed || target == TaskRunCanceled) && taskErr != nil {
 		task.Error = taskErr.Error()
 	}
+	if target.terminal() {
+		task.FinishedAt = timestamp
+	}
 	run.tasks[taskID] = task
+	run.updatedAt = timestamp
 
 	return nil
 }
@@ -199,6 +269,7 @@ func (run *WorkflowRun) transitionWorkflow(target WorkflowRunStatus) error {
 		}
 	}
 	run.status = target
+	run.updatedAt = run.nextTimestampLocked()
 	return nil
 }
 
@@ -206,6 +277,8 @@ func (run *WorkflowRun) cancelUnfinished(cause error) {
 	run.mu.Lock()
 	defer run.mu.Unlock()
 
+	timestamp := run.nextTimestampLocked()
+	changed := false
 	for taskID, task := range run.tasks {
 		if task.Status != TaskRunPending && task.Status != TaskRunReady && task.Status != TaskRunRunning {
 			continue
@@ -213,11 +286,26 @@ func (run *WorkflowRun) cancelUnfinished(cause error) {
 
 		task.Status = TaskRunCanceled
 		task.Output = ""
+		task.Error = ""
 		if cause != nil {
 			task.Error = cause.Error()
 		}
+		task.UpdatedAt = timestamp
+		task.FinishedAt = timestamp
 		run.tasks[taskID] = task
+		changed = true
 	}
+	if changed {
+		run.updatedAt = timestamp
+	}
+}
+
+func (run *WorkflowRun) nextTimestampLocked() time.Time {
+	timestamp := run.now().UTC()
+	if timestamp.Before(run.updatedAt) {
+		return run.updatedAt
+	}
+	return timestamp
 }
 
 // Task transitions follow pending -> ready -> running -> succeeded|failed.
@@ -246,6 +334,10 @@ func legalWorkflowTransition(from, to WorkflowRunStatus) bool {
 	default:
 		return false
 	}
+}
+
+func (status TaskRunStatus) terminal() bool {
+	return status == TaskRunSucceeded || status == TaskRunFailed || status == TaskRunCanceled
 }
 
 func validRunID(runID string) bool {

@@ -1,0 +1,169 @@
+package execution
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/vijaypratap3364/forgeflow/internal/workflow"
+)
+
+// Store is the durability boundary used by the execution engine. Implementations
+// must make each mutation atomic from a caller's perspective.
+type Store interface {
+	SaveWorkflow(context.Context, workflow.WorkflowDefinition) error
+	LoadWorkflow(context.Context, workflow.WorkflowID) (workflow.WorkflowDefinition, bool, error)
+	CreateRun(context.Context, WorkflowRunSnapshot) error
+	SaveRun(context.Context, WorkflowRunSnapshot) error
+	LoadRun(context.Context, RunID) (WorkflowRunSnapshot, bool, error)
+}
+
+// WorkflowRunSnapshot is the durable representation of a workflow execution.
+// The workflow definition is stored separately and referenced by WorkflowID.
+type WorkflowRunSnapshot struct {
+	ID         RunID
+	WorkflowID workflow.WorkflowID
+	Status     WorkflowRunStatus
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
+	Tasks      []TaskRun
+}
+
+// Validate verifies the snapshot's storage-level invariants.
+func (snapshot WorkflowRunSnapshot) Validate() error {
+	if !validIdentifier(string(snapshot.ID)) {
+		return &SnapshotValidationError{RunID: snapshot.ID, Reason: "run ID is empty or invalid"}
+	}
+	if !validIdentifier(string(snapshot.WorkflowID)) {
+		return &SnapshotValidationError{RunID: snapshot.ID, Reason: "workflow ID is empty or invalid"}
+	}
+	if !snapshot.Status.valid() {
+		return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("unknown workflow status %q", snapshot.Status)}
+	}
+	if snapshot.CreatedAt.IsZero() {
+		return &SnapshotValidationError{RunID: snapshot.ID, Reason: "creation timestamp is missing"}
+	}
+	if snapshot.UpdatedAt.IsZero() || snapshot.UpdatedAt.Before(snapshot.CreatedAt) {
+		return &SnapshotValidationError{RunID: snapshot.ID, Reason: "update timestamp is missing or precedes creation"}
+	}
+	if len(snapshot.Tasks) == 0 {
+		return &SnapshotValidationError{RunID: snapshot.ID, Reason: "task runs are missing"}
+	}
+
+	seen := make(map[workflow.TaskID]struct{}, len(snapshot.Tasks))
+	for _, task := range snapshot.Tasks {
+		if !validIdentifier(string(task.TaskID)) {
+			return &SnapshotValidationError{RunID: snapshot.ID, Reason: "task run has an empty or invalid task ID"}
+		}
+		if _, exists := seen[task.TaskID]; exists {
+			return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("duplicate task run %q", task.TaskID)}
+		}
+		seen[task.TaskID] = struct{}{}
+
+		if !task.Status.valid() {
+			return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("task %q has unknown status %q", task.TaskID, task.Status)}
+		}
+		if task.AttemptCount < 0 {
+			return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("task %q has a negative attempt count", task.TaskID)}
+		}
+		if task.UpdatedAt.IsZero() || task.UpdatedAt.Before(snapshot.CreatedAt) {
+			return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("task %q has an invalid update timestamp", task.TaskID)}
+		}
+		if task.Status == TaskRunRunning && (task.AttemptCount == 0 || task.StartedAt.IsZero()) {
+			return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("running task %q has no recorded attempt", task.TaskID)}
+		}
+		if (task.Status == TaskRunSucceeded || task.Status == TaskRunFailed) &&
+			(task.AttemptCount == 0 || task.FinishedAt.IsZero()) {
+			return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("completed task %q has no recorded attempt", task.TaskID)}
+		}
+		if task.Status == TaskRunCanceled && task.FinishedAt.IsZero() {
+			return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("canceled task %q has no finish timestamp", task.TaskID)}
+		}
+	}
+
+	return nil
+}
+
+// RestoreWorkflowRun reconstructs a mutable aggregate from its durable snapshot
+// and immutable workflow definition.
+func RestoreWorkflowRun(
+	snapshot WorkflowRunSnapshot,
+	definition workflow.WorkflowDefinition,
+) (*WorkflowRun, error) {
+	return restoreWorkflowRun(snapshot, definition, time.Now)
+}
+
+func restoreWorkflowRun(
+	snapshot WorkflowRunSnapshot,
+	definition workflow.WorkflowDefinition,
+	now func() time.Time,
+) (*WorkflowRun, error) {
+	if err := snapshot.Validate(); err != nil {
+		return nil, err
+	}
+	if err := definition.Validate(); err != nil {
+		return nil, err
+	}
+	if snapshot.WorkflowID != definition.ID {
+		return nil, &SnapshotValidationError{
+			RunID:  snapshot.ID,
+			Reason: fmt.Sprintf("references workflow %q, not %q", snapshot.WorkflowID, definition.ID),
+		}
+	}
+	if len(snapshot.Tasks) != len(definition.Tasks) {
+		return nil, &SnapshotValidationError{RunID: snapshot.ID, Reason: "task runs do not match workflow definition"}
+	}
+
+	tasks := make(map[workflow.TaskID]TaskRun, len(snapshot.Tasks))
+	for _, task := range snapshot.Tasks {
+		tasks[task.TaskID] = task
+	}
+	for _, task := range definition.Tasks {
+		if _, exists := tasks[task.ID]; !exists {
+			return nil, &SnapshotValidationError{
+				RunID:  snapshot.ID,
+				Reason: fmt.Sprintf("task run %q is missing", task.ID),
+			}
+		}
+	}
+	if now == nil {
+		now = time.Now
+	}
+
+	return &WorkflowRun{
+		id:         snapshot.ID,
+		definition: cloneDefinition(definition),
+		status:     snapshot.Status,
+		tasks:      tasks,
+		createdAt:  snapshot.CreatedAt,
+		updatedAt:  snapshot.UpdatedAt,
+		now:        now,
+	}, nil
+}
+
+func (status WorkflowRunStatus) valid() bool {
+	switch status {
+	case WorkflowRunPending,
+		WorkflowRunRunning,
+		WorkflowRunSucceeded,
+		WorkflowRunFailed,
+		WorkflowRunCanceled:
+		return true
+	default:
+		return false
+	}
+}
+
+func (status TaskRunStatus) valid() bool {
+	switch status {
+	case TaskRunPending,
+		TaskRunReady,
+		TaskRunRunning,
+		TaskRunSucceeded,
+		TaskRunFailed,
+		TaskRunCanceled:
+		return true
+	default:
+		return false
+	}
+}
