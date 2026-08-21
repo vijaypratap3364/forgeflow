@@ -302,6 +302,55 @@ func TestWorkflowRunCancellation(t *testing.T) {
 	}
 }
 
+func TestRunEventStreamStopsOnClientDisconnect(t *testing.T) {
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	server := newTestServer(t, func(registry *execution.HandlerRegistry) {
+		if err := registry.Register("disconnect-block", execution.TaskHandlerFunc(func(ctx context.Context, _ execution.TaskRequest) (string, error) {
+			close(started)
+			<-ctx.Done()
+			close(stopped)
+			return "", ctx.Err()
+		})); err != nil {
+			t.Fatalf("Register() error = %v", err)
+		}
+	})
+	submitWorkflow(t, server, `{
+		"id":"disconnect-workflow",
+		"tasks":[{"id":"wait","name":"Wait","handler":"disconnect-block"}]
+	}`)
+	created := request(
+		t,
+		server,
+		http.MethodPost,
+		"/api/v1/workflows/disconnect-workflow/runs",
+		`{"run_id":"disconnect-run"}`,
+		"application/json",
+	)
+	assertStatus(t, created, http.StatusAccepted)
+	waitForSignal(t, started, "task start before SSE disconnect")
+
+	streamContext, disconnect := context.WithCancel(context.Background())
+	streamRequest := httptest.NewRequest(
+		http.MethodGet,
+		"/api/v1/runs/disconnect-run/events",
+		nil,
+	).WithContext(streamContext)
+	streamWriter := newFlushSignalRecorder()
+	streamReturned := make(chan struct{})
+	go func() {
+		server.ServeHTTP(streamWriter, streamRequest)
+		close(streamReturned)
+	}()
+	waitForSignal(t, streamWriter.flushed, "SSE response flush")
+	disconnect()
+	waitForSignal(t, streamReturned, "SSE handler return after client disconnect")
+
+	canceled := request(t, server, http.MethodPost, "/api/v1/runs/disconnect-run/cancel", "", "")
+	assertStatus(t, canceled, http.StatusAccepted)
+	waitForSignal(t, stopped, "handler cancellation after SSE disconnect")
+}
+
 func TestServerShutdownCancelsActiveRun(t *testing.T) {
 	started := make(chan struct{})
 	stopped := make(chan struct{})
@@ -525,4 +574,22 @@ func decodeResponse(t *testing.T, response *httptest.ResponseRecorder, destinati
 	if err := decoder.Decode(destination); err != nil {
 		t.Fatalf("decode response %q: %v", response.Body.String(), err)
 	}
+}
+
+type flushSignalRecorder struct {
+	*httptest.ResponseRecorder
+	flushed chan struct{}
+	once    sync.Once
+}
+
+func newFlushSignalRecorder() *flushSignalRecorder {
+	return &flushSignalRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+		flushed:          make(chan struct{}),
+	}
+}
+
+func (recorder *flushSignalRecorder) Flush() {
+	recorder.ResponseRecorder.Flush()
+	recorder.once.Do(func() { close(recorder.flushed) })
 }
