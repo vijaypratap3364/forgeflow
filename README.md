@@ -8,9 +8,9 @@ Reliable workflow execution is more than running functions in order. A useful en
 
 ## Current status
 
-**Stage 1: workflow model and DAG validation.** ForgeFlow now provides in-memory workflow and task definitions, typed validation errors, cycle detection, deterministic topological ordering, root-task discovery, and ready-task discovery from a set of completed tasks.
+**Stage 2: in-process workflow execution.** ForgeFlow now provides validated workflow definitions, explicit workflow/task run state machines, a scheduler, a safe task-handler registry, and configurable concurrent workers backed entirely by Go goroutines and channels.
 
-Scheduling, task execution, workers, persistence, retries, APIs, brokers, authentication, and deployment infrastructure have not been implemented. The next milestone is bounded local execution through a registry of safe task handlers. See [the roadmap](docs/roadmap.md) for the planned progression and [the architecture notes](docs/architecture.md) for the current/future boundary.
+Independent tasks run concurrently, successful dependencies unlock downstream work, and task failure or context cancellation stops unfinished work consistently. Persistence, retries, leases, remote workers, APIs, brokers, authentication, and deployment infrastructure have not been implemented. See [the roadmap](docs/roadmap.md) for the planned progression and [the architecture notes](docs/architecture.md) for the current/future boundary.
 
 ## Local development
 
@@ -31,10 +31,11 @@ On systems with `make`, `make check` runs formatting, vetting, tests, and a buil
 ## Repository layout
 
 ```text
-cmd/forgeflow/   executable entry point
-internal/app/    bootstrap application behavior
-internal/workflow/ workflow definitions and DAG semantics
-docs/            architecture and delivery roadmap
+cmd/forgeflow/      executable entry point
+internal/app/       bootstrap application behavior
+internal/execution/ run state, scheduler, handlers, and workers
+internal/workflow/  workflow definitions and DAG semantics
+docs/               architecture and delivery roadmap
 ```
 
 The module uses the canonical import path `github.com/vijaypratap3364/forgeflow`, derived from the configured `origin` remote.

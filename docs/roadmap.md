@@ -20,14 +20,14 @@ Exit condition: formatting, vetting, tests, and build all pass with the native G
 
 Keep this stage in memory and independent of workers, databases, brokers, and HTTP.
 
-## Stage 2 — Local execution (next)
+## Stage 2 — Local execution (complete)
 
 - Add a registry of safe, typed task handlers rather than arbitrary shell commands.
 - Execute independent ready tasks concurrently with bounded parallelism.
 - Propagate cancellation and record task outcomes through explicit state transitions.
 - Exercise complete workflows in deterministic process-level tests.
 
-## Stage 3 — Reliable attempts and recovery semantics
+## Stage 3 — Reliable attempts and recovery semantics (next)
 
 - Model attempts, retry policy, backoff, leases, and idempotency keys.
 - Prevent duplicate claims and duplicate committed completion.

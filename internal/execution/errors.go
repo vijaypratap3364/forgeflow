@@ -6,6 +6,72 @@ import (
 	"github.com/vijaypratap3364/forgeflow/internal/workflow"
 )
 
+// InvalidEngineConfigError reports configuration that cannot create an engine.
+type InvalidEngineConfigError struct {
+	WorkerCount int
+	Reason      string
+}
+
+// Error returns a contextual description of the invalid engine configuration.
+func (e *InvalidEngineConfigError) Error() string {
+	return fmt.Sprintf("invalid execution engine configuration with %d workers: %s", e.WorkerCount, e.Reason)
+}
+
+// HandlerRegistrationError reports an invalid or duplicate handler registration.
+type HandlerRegistrationError struct {
+	HandlerName workflow.HandlerName
+	Reason      string
+}
+
+// Error returns a contextual description of the failed registration.
+func (e *HandlerRegistrationError) Error() string {
+	return fmt.Sprintf("cannot register task handler %q: %s", e.HandlerName, e.Reason)
+}
+
+// UnknownHandlerError reports a task that refers to an unregistered handler.
+type UnknownHandlerError struct {
+	TaskID      workflow.TaskID
+	HandlerName workflow.HandlerName
+}
+
+// Error returns a contextual description of the unresolved handler.
+func (e *UnknownHandlerError) Error() string {
+	return fmt.Sprintf("task %q references unregistered handler %q", e.TaskID, e.HandlerName)
+}
+
+// TaskExecutionError reports the handler failure that stopped a workflow run.
+type TaskExecutionError struct {
+	RunID  RunID
+	TaskID workflow.TaskID
+	Cause  error
+}
+
+// Error returns a contextual description of the handler failure.
+func (e *TaskExecutionError) Error() string {
+	return fmt.Sprintf("task %q in workflow run %q failed: %v", e.TaskID, e.RunID, e.Cause)
+}
+
+// Unwrap exposes the handler error for errors.Is and errors.As.
+func (e *TaskExecutionError) Unwrap() error {
+	return e.Cause
+}
+
+// RunCanceledError reports a workflow run stopped by context cancellation.
+type RunCanceledError struct {
+	RunID RunID
+	Cause error
+}
+
+// Error returns a contextual description of the canceled workflow run.
+func (e *RunCanceledError) Error() string {
+	return fmt.Sprintf("workflow run %q canceled: %v", e.RunID, e.Cause)
+}
+
+// Unwrap exposes the context error for errors.Is and errors.As.
+func (e *RunCanceledError) Unwrap() error {
+	return e.Cause
+}
+
 // InvalidRunIDError reports an empty or malformed workflow run ID.
 type InvalidRunIDError struct {
 	RunID RunID

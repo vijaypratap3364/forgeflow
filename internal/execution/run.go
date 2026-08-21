@@ -249,10 +249,14 @@ func legalWorkflowTransition(from, to WorkflowRunStatus) bool {
 }
 
 func validRunID(runID string) bool {
-	if runID == "" {
+	return validIdentifier(runID)
+}
+
+func validIdentifier(identifier string) bool {
+	if identifier == "" {
 		return false
 	}
-	for _, character := range runID {
+	for _, character := range identifier {
 		if unicode.IsSpace(character) || unicode.IsControl(character) {
 			return false
 		}

@@ -7,11 +7,16 @@ type WorkflowID string
 // TaskID is the stable identifier of a task within a workflow definition.
 type TaskID string
 
-// TaskDefinition describes a task and the tasks that must complete before it.
+// HandlerName identifies a safe task handler registered with the execution engine.
+type HandlerName string
+
+// TaskDefinition describes a task, its dependencies, and its safe handler input.
 type TaskDefinition struct {
 	ID           TaskID
 	Name         string
 	Dependencies []TaskID
+	Handler      HandlerName
+	Input        string
 }
 
 // WorkflowDefinition describes a workflow as a collection of task definitions.
