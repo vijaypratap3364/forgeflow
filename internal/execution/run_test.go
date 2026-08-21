@@ -32,8 +32,8 @@ func TestNewWorkflowRunCreatesIndependentPendingState(t *testing.T) {
 	}
 
 	wantTasks := []TaskRun{
-		{TaskID: "a", Status: TaskRunPending, UpdatedAt: run.CreatedAt()},
-		{TaskID: "b", Status: TaskRunPending, UpdatedAt: run.CreatedAt()},
+		{TaskID: "a", TaskRunID: TaskRunIDFor("run-1", "a"), Status: TaskRunPending, UpdatedAt: run.CreatedAt()},
+		{TaskID: "b", TaskRunID: TaskRunIDFor("run-1", "b"), Status: TaskRunPending, UpdatedAt: run.CreatedAt()},
 	}
 	if got := run.Tasks(); !reflect.DeepEqual(got, wantTasks) {
 		t.Fatalf("Tasks() = %#v, want %#v", got, wantTasks)

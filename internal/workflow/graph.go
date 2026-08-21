@@ -164,6 +164,14 @@ func buildDependencyGraph(definition WorkflowDefinition) (*dependencyGraph, erro
 				TaskID:     task.ID,
 			}
 		}
+		if reason := invalidRetryPolicyReason(task.Retry); reason != "" {
+			return nil, &ValidationError{
+				Code:       ValidationInvalidRetryPolicy,
+				WorkflowID: definition.ID,
+				TaskID:     task.ID,
+				Reason:     reason,
+			}
+		}
 		if _, exists := graph.tasks[task.ID]; exists {
 			return nil, &ValidationError{
 				Code:       ValidationDuplicateTaskID,
@@ -228,6 +236,22 @@ func buildDependencyGraph(definition WorkflowDefinition) (*dependencyGraph, erro
 	}
 
 	return graph, nil
+}
+
+func invalidRetryPolicyReason(policy RetryPolicy) string {
+	if policy.MaxAttempts < 0 {
+		return "maximum attempts must not be negative"
+	}
+	if policy.InitialBackoff < 0 {
+		return "initial backoff must not be negative"
+	}
+	if policy.MaxBackoff < 0 {
+		return "maximum backoff must not be negative"
+	}
+	if policy.MaxBackoff > 0 && policy.MaxBackoff < policy.InitialBackoff {
+		return "maximum backoff must not be less than initial backoff"
+	}
+	return ""
 }
 
 func (graph *dependencyGraph) topologicalOrder() ([]TaskID, bool) {

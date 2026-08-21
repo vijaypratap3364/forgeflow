@@ -394,7 +394,15 @@ func cloneDefinition(definition workflow.WorkflowDefinition) workflow.WorkflowDe
 
 func cloneSnapshot(snapshot execution.WorkflowRunSnapshot) execution.WorkflowRunSnapshot {
 	clone := snapshot
-	clone.Tasks = append([]execution.TaskRun(nil), snapshot.Tasks...)
+	clone.Tasks = make([]execution.TaskRun, len(snapshot.Tasks))
+	for index, task := range snapshot.Tasks {
+		clone.Tasks[index] = task
+		if task.Lease != nil {
+			lease := *task.Lease
+			clone.Tasks[index].Lease = &lease
+		}
+	}
+	clone.Workers = append([]execution.WorkerHeartbeat(nil), snapshot.Workers...)
 	return clone
 }
 

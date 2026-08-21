@@ -39,6 +39,8 @@ const (
 	TaskRunReady TaskRunStatus = "ready"
 	// TaskRunRunning indicates that a worker is executing the task.
 	TaskRunRunning TaskRunStatus = "running"
+	// TaskRunRetryWaiting indicates that a retryable task is waiting for backoff.
+	TaskRunRetryWaiting TaskRunStatus = "retry_wait"
 	// TaskRunSucceeded indicates that the handler completed successfully.
 	TaskRunSucceeded TaskRunStatus = "succeeded"
 	// TaskRunFailed indicates that the handler returned an error.
@@ -49,14 +51,18 @@ const (
 
 // TaskRun is an immutable snapshot of one task's execution state.
 type TaskRun struct {
-	TaskID       workflow.TaskID
-	Status       TaskRunStatus
-	Output       string
-	Error        string
-	AttemptCount int
-	UpdatedAt    time.Time
-	StartedAt    time.Time
-	FinishedAt   time.Time
+	TaskID           workflow.TaskID
+	TaskRunID        TaskRunID
+	Status           TaskRunStatus
+	Output           string
+	Error            string
+	AttemptCount     int
+	CurrentAttemptID AttemptID
+	NextAttemptAt    time.Time
+	Lease            *TaskLease
+	UpdatedAt        time.Time
+	StartedAt        time.Time
+	FinishedAt       time.Time
 }
 
 // WorkflowRun tracks the mutable state of one workflow execution. Its public
@@ -67,6 +73,7 @@ type WorkflowRun struct {
 	definition workflow.WorkflowDefinition
 	status     WorkflowRunStatus
 	tasks      map[workflow.TaskID]TaskRun
+	workers    map[WorkerID]WorkerHeartbeat
 	createdAt  time.Time
 	updatedAt  time.Time
 	now        func() time.Time
@@ -98,6 +105,7 @@ func newWorkflowRun(
 	for _, task := range definition.Tasks {
 		tasks[task.ID] = TaskRun{
 			TaskID:    task.ID,
+			TaskRunID: TaskRunIDFor(runID, task.ID),
 			Status:    TaskRunPending,
 			UpdatedAt: createdAt,
 		}
@@ -108,6 +116,7 @@ func newWorkflowRun(
 		definition: definition,
 		status:     WorkflowRunPending,
 		tasks:      tasks,
+		workers:    make(map[WorkerID]WorkerHeartbeat),
 		createdAt:  createdAt,
 		updatedAt:  createdAt,
 		now:        now,
@@ -162,7 +171,7 @@ func (run *WorkflowRun) Task(taskID workflow.TaskID) (TaskRun, bool) {
 	defer run.mu.RUnlock()
 
 	task, exists := run.tasks[taskID]
-	return task, exists
+	return cloneTaskRun(task), exists
 }
 
 // Tasks returns task-run snapshots ordered lexicographically by task ID.
@@ -176,7 +185,7 @@ func (run *WorkflowRun) Tasks() []TaskRun {
 func (run *WorkflowRun) sortedTasksLocked() []TaskRun {
 	tasks := make([]TaskRun, 0, len(run.tasks))
 	for _, task := range run.tasks {
-		tasks = append(tasks, task)
+		tasks = append(tasks, cloneTaskRun(task))
 	}
 	sort.Slice(tasks, func(left, right int) bool {
 		return tasks[left].TaskID < tasks[right].TaskID
@@ -196,6 +205,7 @@ func (run *WorkflowRun) Snapshot() WorkflowRunSnapshot {
 		CreatedAt:  run.createdAt,
 		UpdatedAt:  run.updatedAt,
 		Tasks:      run.sortedTasksLocked(),
+		Workers:    run.sortedWorkersLocked(),
 	}
 }
 
@@ -239,8 +249,11 @@ func (run *WorkflowRun) transitionTask(
 	task.UpdatedAt = timestamp
 	if target == TaskRunRunning {
 		task.AttemptCount++
+		task.TaskRunID = TaskRunIDFor(run.id, taskID)
+		task.CurrentAttemptID = AttemptIDFor(task.TaskRunID, task.AttemptCount)
 		task.StartedAt = timestamp
 		task.FinishedAt = time.Time{}
+		task.NextAttemptAt = time.Time{}
 	}
 	if target == TaskRunSucceeded {
 		task.Output = output
@@ -250,6 +263,8 @@ func (run *WorkflowRun) transitionTask(
 	}
 	if target.terminal() {
 		task.FinishedAt = timestamp
+		task.Lease = nil
+		task.NextAttemptAt = time.Time{}
 	}
 	run.tasks[taskID] = task
 	run.updatedAt = timestamp
@@ -280,7 +295,7 @@ func (run *WorkflowRun) cancelUnfinished(cause error) {
 	timestamp := run.nextTimestampLocked()
 	changed := false
 	for taskID, task := range run.tasks {
-		if task.Status != TaskRunPending && task.Status != TaskRunReady && task.Status != TaskRunRunning {
+		if task.Status != TaskRunPending && task.Status != TaskRunReady && task.Status != TaskRunRunning && task.Status != TaskRunRetryWaiting {
 			continue
 		}
 
@@ -292,6 +307,8 @@ func (run *WorkflowRun) cancelUnfinished(cause error) {
 		}
 		task.UpdatedAt = timestamp
 		task.FinishedAt = timestamp
+		task.NextAttemptAt = time.Time{}
+		task.Lease = nil
 		run.tasks[taskID] = task
 		changed = true
 	}
@@ -318,6 +335,8 @@ func (run *WorkflowRun) recoverInterruptedTasks() bool {
 		task.Error = ""
 		task.UpdatedAt = timestamp
 		task.FinishedAt = time.Time{}
+		task.Lease = nil
+		task.NextAttemptAt = time.Time{}
 		run.tasks[taskID] = task
 		changed = true
 	}
@@ -345,6 +364,8 @@ func legalTaskTransition(from, to TaskRunStatus) bool {
 		return to == TaskRunRunning || to == TaskRunCanceled
 	case TaskRunRunning:
 		return to == TaskRunSucceeded || to == TaskRunFailed || to == TaskRunCanceled
+	case TaskRunRetryWaiting:
+		return to == TaskRunReady || to == TaskRunCanceled
 	default:
 		return false
 	}
@@ -391,6 +412,15 @@ func cloneDefinition(definition workflow.WorkflowDefinition) workflow.WorkflowDe
 	for index, task := range definition.Tasks {
 		clone.Tasks[index] = task
 		clone.Tasks[index].Dependencies = append([]workflow.TaskID(nil), task.Dependencies...)
+	}
+	return clone
+}
+
+func cloneTaskRun(task TaskRun) TaskRun {
+	clone := task
+	if task.Lease != nil {
+		lease := *task.Lease
+		clone.Lease = &lease
 	}
 	return clone
 }

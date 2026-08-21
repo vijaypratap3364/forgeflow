@@ -1,10 +1,41 @@
 package execution
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/vijaypratap3364/forgeflow/internal/workflow"
 )
+
+// RetryableTaskError marks a handler failure as transient. Unmarked handler
+// errors are terminal and are not retried.
+type RetryableTaskError struct {
+	Cause error
+}
+
+// Error returns the underlying transient failure message.
+func (e *RetryableTaskError) Error() string {
+	return e.Cause.Error()
+}
+
+// Unwrap exposes the transient failure for errors.Is and errors.As.
+func (e *RetryableTaskError) Unwrap() error {
+	return e.Cause
+}
+
+// Retryable marks a non-nil handler failure as eligible for retry.
+func Retryable(cause error) error {
+	if cause == nil {
+		return nil
+	}
+	return &RetryableTaskError{Cause: cause}
+}
+
+// IsRetryable reports whether an error chain contains a retryable task marker.
+func IsRetryable(err error) bool {
+	var retryable *RetryableTaskError
+	return errors.As(err, &retryable)
+}
 
 // InvalidEngineConfigError reports configuration that cannot create an engine.
 type InvalidEngineConfigError struct {
@@ -44,6 +75,19 @@ type TaskExecutionError struct {
 	RunID  RunID
 	TaskID workflow.TaskID
 	Cause  error
+}
+
+// LeaseExpiredError reports an attempt abandoned after its worker stopped
+// renewing the persisted lease.
+type LeaseExpiredError struct {
+	RunID     RunID
+	TaskID    workflow.TaskID
+	AttemptID AttemptID
+}
+
+// Error returns a contextual description of the abandoned attempt.
+func (e *LeaseExpiredError) Error() string {
+	return fmt.Sprintf("lease expired for attempt %q of task %q in workflow run %q", e.AttemptID, e.TaskID, e.RunID)
 }
 
 // Error returns a contextual description of the handler failure.

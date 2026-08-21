@@ -27,6 +27,7 @@ type WorkflowRunSnapshot struct {
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
 	Tasks      []TaskRun
+	Workers    []WorkerHeartbeat
 }
 
 // Validate verifies the snapshot's storage-level invariants.
@@ -52,6 +53,7 @@ func (snapshot WorkflowRunSnapshot) Validate() error {
 
 	seen := make(map[workflow.TaskID]struct{}, len(snapshot.Tasks))
 	statusCounts := make(map[TaskRunStatus]int)
+	leasedWorkers := make(map[WorkerID]struct{})
 	for _, task := range snapshot.Tasks {
 		if !validIdentifier(string(task.TaskID)) {
 			return &SnapshotValidationError{RunID: snapshot.ID, Reason: "task run has an empty or invalid task ID"}
@@ -60,12 +62,22 @@ func (snapshot WorkflowRunSnapshot) Validate() error {
 			return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("duplicate task run %q", task.TaskID)}
 		}
 		seen[task.TaskID] = struct{}{}
+		expectedTaskRunID := TaskRunIDFor(snapshot.ID, task.TaskID)
+		if task.TaskRunID != "" && task.TaskRunID != expectedTaskRunID {
+			return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("task %q has an invalid task-run ID", task.TaskID)}
+		}
 
 		if !task.Status.valid() {
 			return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("task %q has unknown status %q", task.TaskID, task.Status)}
 		}
 		if task.AttemptCount < 0 {
 			return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("task %q has a negative attempt count", task.TaskID)}
+		}
+		if task.AttemptCount == 0 && task.CurrentAttemptID != "" {
+			return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("task %q has an attempt ID without an attempt", task.TaskID)}
+		}
+		if task.CurrentAttemptID != "" && task.CurrentAttemptID != AttemptIDFor(expectedTaskRunID, task.AttemptCount) {
+			return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("task %q has an invalid current attempt ID", task.TaskID)}
 		}
 		if task.UpdatedAt.IsZero() || task.UpdatedAt.Before(snapshot.CreatedAt) {
 			return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("task %q has an invalid update timestamp", task.TaskID)}
@@ -80,7 +92,40 @@ func (snapshot WorkflowRunSnapshot) Validate() error {
 		if task.Status == TaskRunCanceled && task.FinishedAt.IsZero() {
 			return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("canceled task %q has no finish timestamp", task.TaskID)}
 		}
+		if task.Status == TaskRunRetryWaiting && task.NextAttemptAt.IsZero() {
+			return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("retry-waiting task %q has no retry deadline", task.TaskID)}
+		}
+		if task.Status == TaskRunRetryWaiting && (task.AttemptCount == 0 || task.CurrentAttemptID == "") {
+			return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("retry-waiting task %q has no completed attempt", task.TaskID)}
+		}
+		if task.Status != TaskRunRetryWaiting && !task.NextAttemptAt.IsZero() {
+			return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("task %q has a retry deadline outside retry-wait state", task.TaskID)}
+		}
+		if task.Lease != nil {
+			if task.Status != TaskRunRunning || !validIdentifier(string(task.Lease.WorkerID)) ||
+				task.TaskRunID != expectedTaskRunID || !validIdentifier(string(task.Lease.AttemptID)) ||
+				task.Lease.TaskRunID != expectedTaskRunID ||
+				task.Lease.AttemptID != task.CurrentAttemptID || task.Lease.ExpiresAt.IsZero() {
+				return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("task %q has an invalid lease", task.TaskID)}
+			}
+			leasedWorkers[task.Lease.WorkerID] = struct{}{}
+		}
 		statusCounts[task.Status]++
+	}
+	seenWorkers := make(map[WorkerID]struct{}, len(snapshot.Workers))
+	for _, worker := range snapshot.Workers {
+		if !validIdentifier(string(worker.WorkerID)) || worker.LastHeartbeatAt.IsZero() || worker.LastHeartbeatAt.Before(snapshot.CreatedAt) {
+			return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("worker %q has invalid heartbeat state", worker.WorkerID)}
+		}
+		if _, exists := seenWorkers[worker.WorkerID]; exists {
+			return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("duplicate worker heartbeat %q", worker.WorkerID)}
+		}
+		seenWorkers[worker.WorkerID] = struct{}{}
+	}
+	for workerID := range leasedWorkers {
+		if _, exists := seenWorkers[workerID]; !exists {
+			return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("lease references worker %q without heartbeat state", workerID)}
+		}
 	}
 	if err := validateAggregateStatus(snapshot, statusCounts); err != nil {
 		return err
@@ -90,7 +135,7 @@ func (snapshot WorkflowRunSnapshot) Validate() error {
 }
 
 func validateAggregateStatus(snapshot WorkflowRunSnapshot, counts map[TaskRunStatus]int) error {
-	unfinished := counts[TaskRunPending] + counts[TaskRunReady] + counts[TaskRunRunning]
+	unfinished := counts[TaskRunPending] + counts[TaskRunReady] + counts[TaskRunRunning] + counts[TaskRunRetryWaiting]
 	switch snapshot.Status {
 	case WorkflowRunPending:
 		if counts[TaskRunPending] != len(snapshot.Tasks) {
@@ -148,7 +193,13 @@ func restoreWorkflowRun(
 
 	tasks := make(map[workflow.TaskID]TaskRun, len(snapshot.Tasks))
 	for _, task := range snapshot.Tasks {
-		tasks[task.TaskID] = task
+		if task.TaskRunID == "" {
+			task.TaskRunID = TaskRunIDFor(snapshot.ID, task.TaskID)
+		}
+		if task.CurrentAttemptID == "" && task.AttemptCount > 0 {
+			task.CurrentAttemptID = AttemptIDFor(task.TaskRunID, task.AttemptCount)
+		}
+		tasks[task.TaskID] = cloneTaskRun(task)
 	}
 	for _, task := range definition.Tasks {
 		if _, exists := tasks[task.ID]; !exists {
@@ -161,12 +212,17 @@ func restoreWorkflowRun(
 	if now == nil {
 		now = time.Now
 	}
+	workers := make(map[WorkerID]WorkerHeartbeat, len(snapshot.Workers))
+	for _, worker := range snapshot.Workers {
+		workers[worker.WorkerID] = worker
+	}
 
 	return &WorkflowRun{
 		id:         snapshot.ID,
 		definition: cloneDefinition(definition),
 		status:     snapshot.Status,
 		tasks:      tasks,
+		workers:    workers,
 		createdAt:  snapshot.CreatedAt,
 		updatedAt:  snapshot.UpdatedAt,
 		now:        now,
@@ -191,6 +247,7 @@ func (status TaskRunStatus) valid() bool {
 	case TaskRunPending,
 		TaskRunReady,
 		TaskRunRunning,
+		TaskRunRetryWaiting,
 		TaskRunSucceeded,
 		TaskRunFailed,
 		TaskRunCanceled:

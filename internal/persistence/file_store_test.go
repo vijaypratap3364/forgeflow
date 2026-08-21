@@ -117,6 +117,9 @@ func TestFileStoreRepositoryErrors(t *testing.T) {
 	t.Run("missing run", func(t *testing.T) {
 		missing := snapshot
 		missing.ID = "missing-run"
+		for index := range missing.Tasks {
+			missing.Tasks[index].TaskRunID = execution.TaskRunIDFor(missing.ID, missing.Tasks[index].TaskID)
+		}
 		var target *execution.RunNotFoundError
 		if err := store.SaveRun(context.Background(), missing); !errors.As(err, &target) {
 			t.Fatalf("SaveRun() error = %v, want *RunNotFoundError", err)
@@ -127,6 +130,9 @@ func TestFileStoreRepositoryErrors(t *testing.T) {
 		missing := snapshot
 		missing.ID = "another-run"
 		missing.WorkflowID = "missing-workflow"
+		for index := range missing.Tasks {
+			missing.Tasks[index].TaskRunID = execution.TaskRunIDFor(missing.ID, missing.Tasks[index].TaskID)
+		}
 		var target *execution.WorkflowNotFoundError
 		if err := store.CreateRun(context.Background(), missing); !errors.As(err, &target) {
 			t.Fatalf("CreateRun() error = %v, want *WorkflowNotFoundError", err)

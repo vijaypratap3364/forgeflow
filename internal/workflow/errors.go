@@ -28,6 +28,8 @@ const (
 	ValidationCycle ValidationCode = "cycle"
 	// ValidationUnknownCompletedTask identifies completed state for an undefined task.
 	ValidationUnknownCompletedTask ValidationCode = "unknown_completed_task"
+	// ValidationInvalidRetryPolicy identifies invalid retry limits or delays.
+	ValidationInvalidRetryPolicy ValidationCode = "invalid_retry_policy"
 )
 
 // ValidationError describes a workflow validation failure in a form that later
@@ -37,6 +39,7 @@ type ValidationError struct {
 	WorkflowID   WorkflowID
 	TaskID       TaskID
 	DependencyID TaskID
+	Reason       string
 }
 
 // Error returns a contextual description of the validation failure.
@@ -64,6 +67,8 @@ func (e *ValidationError) Error() string {
 		return fmt.Sprintf("workflow %q contains a dependency cycle", e.WorkflowID)
 	case ValidationUnknownCompletedTask:
 		return fmt.Sprintf("completed task %q is not defined in workflow %q", e.TaskID, e.WorkflowID)
+	case ValidationInvalidRetryPolicy:
+		return fmt.Sprintf("task %q in workflow %q has an invalid retry policy: %s", e.TaskID, e.WorkflowID, e.Reason)
 	default:
 		return fmt.Sprintf("workflow %q is invalid", e.WorkflowID)
 	}
