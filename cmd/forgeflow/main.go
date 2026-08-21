@@ -5,7 +5,7 @@ import (
 	"log"
 	"os"
 
-	"forgeflow/internal/app"
+	"github.com/vijaypratap3364/forgeflow/internal/app"
 )
 
 func main() {

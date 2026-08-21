@@ -2,7 +2,7 @@
 
 The sequence below is intentionally incremental. Each stage should leave the repository buildable, tested, and useful without requiring later infrastructure.
 
-## Stage 0 — Repository foundation (current)
+## Stage 0 — Repository foundation (complete)
 
 - Establish persistent engineering and Git instructions.
 - Initialize the Go module and a conventional project layout.
@@ -11,16 +11,16 @@ The sequence below is intentionally incremental. Each stage should leave the rep
 
 Exit condition: formatting, vetting, tests, and build all pass with the native Go toolchain.
 
-## Stage 1 — Workflow model and DAG semantics
+## Stage 1 — Workflow model and DAG semantics (complete)
 
-- Define workflow and task identities, dependency edges, and lifecycle states.
+- Define workflow and task identities and dependency edges.
 - Validate missing references, self-dependencies, duplicate identities, and cycles.
 - Determine ready tasks deterministically from workflow state.
 - Cover graph and state invariants with table-driven unit tests.
 
 Keep this stage in memory and independent of workers, databases, brokers, and HTTP.
 
-## Stage 2 — Local execution
+## Stage 2 — Local execution (next)
 
 - Add a registry of safe, typed task handlers rather than arbitrary shell commands.
 - Execute independent ready tasks concurrently with bounded parallelism.

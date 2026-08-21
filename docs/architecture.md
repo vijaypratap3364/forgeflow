@@ -8,20 +8,22 @@ This document describes a target direction, not a claim that those components al
 
 ## Current implementation
 
-Stage 0 contains only:
+Stage 1 contains:
 
 - a Go module with no external dependencies;
-- a small command entry point;
-- a bootstrap application function that writes a startup message; and
-- a deterministic unit test.
+- stable workflow and task identifier types plus in-memory definitions;
+- typed, machine-classifiable validation errors with contextual messages;
+- validation for identifiers, names, task uniqueness, dependency references, repeated edges, self-dependencies, and cycles;
+- deterministic topological ordering, root-task discovery, and ready-task discovery; and
+- a small bootstrap command with deterministic unit tests.
 
-There is currently no workflow representation, DAG validation, scheduler, worker runtime, persistence, messaging, HTTP API, authentication, recovery mechanism, or observability stack.
+There is currently no scheduler, task execution, worker runtime, persistence, messaging, HTTP API, authentication, recovery mechanism, or observability stack. `ReadyTasks` is a stateless domain query over a caller-provided set of completed task IDs; it does not claim, dispatch, or execute work.
 
 ## Eventual component boundaries
 
 | Component | Responsibility | Status |
 | --- | --- | --- |
-| Workflow domain | Define workflows, tasks, dependencies, and valid state transitions | Future |
+| Workflow domain | Define workflows, tasks, dependencies, and DAG invariants | Current |
 | Scheduler | Identify ready tasks without violating dependency constraints | Future |
 | Dispatcher | Offer runnable task attempts to workers without duplicate ownership | Future |
 | Worker runtime | Execute registered safe task handlers and report outcomes | Future |
@@ -32,6 +34,12 @@ There is currently no workflow representation, DAG validation, scheduler, worker
 | Observability | Provide structured logs, metrics, traces, and operational diagnostics | Future |
 
 Persistence and messaging should be represented by narrow interfaces when those boundaries become real. Early implementations can be in memory. PostgreSQL and a production message broker should arrive only after their required semantics are understood and covered by contract tests.
+
+## Current graph algorithms
+
+Definition validation builds an adjacency list from dependency to dependent and an indegree count for every task. It rejects malformed definitions before graph traversal, allowing callers to distinguish a bad reference from a valid graph that contains a cycle.
+
+Topological ordering uses Kahn's algorithm. A min-heap of zero-indegree task IDs makes the result lexicographically deterministic even when task definitions or Go map iteration order differ. If the algorithm cannot consume every task, the remaining dependency structure contains a cycle. Root and ready-task results use the same task-ID ordering rule.
 
 ## Target execution flow
 

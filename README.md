@@ -8,9 +8,9 @@ Reliable workflow execution is more than running functions in order. A useful en
 
 ## Current status
 
-**Stage 0: repository bootstrap.** The repository currently contains a minimal executable and deterministic test that prove the Go project builds and runs. Workflow models, scheduling, workers, persistence, retries, APIs, brokers, authentication, and deployment infrastructure have not been implemented yet.
+**Stage 1: workflow model and DAG validation.** ForgeFlow now provides in-memory workflow and task definitions, typed validation errors, cycle detection, deterministic topological ordering, root-task discovery, and ready-task discovery from a set of completed tasks.
 
-The next milestone is an in-memory workflow domain model with DAG validation and deterministic ready-task discovery. See [the roadmap](docs/roadmap.md) for the planned progression and [the architecture notes](docs/architecture.md) for the current/future boundary.
+Scheduling, task execution, workers, persistence, retries, APIs, brokers, authentication, and deployment infrastructure have not been implemented. The next milestone is bounded local execution through a registry of safe task handlers. See [the roadmap](docs/roadmap.md) for the planned progression and [the architecture notes](docs/architecture.md) for the current/future boundary.
 
 ## Local development
 
@@ -33,7 +33,8 @@ On systems with `make`, `make check` runs formatting, vetting, tests, and a buil
 ```text
 cmd/forgeflow/   executable entry point
 internal/app/    bootstrap application behavior
+internal/workflow/ workflow definitions and DAG semantics
 docs/            architecture and delivery roadmap
 ```
 
-The module currently uses the local name `forgeflow` because no Git remote is configured. A canonical import path should be chosen only when a real remote exists; no account or repository URL is assumed.
+The module uses the canonical import path `github.com/vijaypratap3364/forgeflow`, derived from the configured `origin` remote.
