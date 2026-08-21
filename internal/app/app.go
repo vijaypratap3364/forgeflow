@@ -17,6 +17,7 @@ import (
 	"github.com/vijaypratap3364/forgeflow/internal/broker"
 	"github.com/vijaypratap3364/forgeflow/internal/execution"
 	"github.com/vijaypratap3364/forgeflow/internal/persistence"
+	"github.com/vijaypratap3364/forgeflow/internal/security"
 )
 
 const (
@@ -26,6 +27,11 @@ const (
 	defaultBrokerBackend   = "memory"
 	defaultWorkerCount     = 4
 	defaultShutdownTimeout = 10 * time.Second
+	defaultJWTIssuer       = "forgeflow"
+	defaultJWTAudience     = "forgeflow-api"
+	defaultJWTLeeway       = 30 * time.Second
+	defaultRateLimit       = 120
+	defaultRateWindow      = time.Minute
 )
 
 // Config contains process settings for the ForgeFlow API server. PostgresDSN
@@ -41,6 +47,12 @@ type Config struct {
 	NATSSubjectPrefix string
 	WorkerCount       int
 	ShutdownTimeout   time.Duration
+	JWTPublicKeyPEM   string
+	JWTIssuer         string
+	JWTAudience       string
+	JWTLeeway         time.Duration
+	RateLimit         int
+	RateLimitWindow   time.Duration
 }
 
 // DefaultConfig returns laptop-friendly local process defaults.
@@ -56,6 +68,11 @@ func DefaultConfig() Config {
 		NATSSubjectPrefix: natsConfig.SubjectPrefix,
 		WorkerCount:       defaultWorkerCount,
 		ShutdownTimeout:   defaultShutdownTimeout,
+		JWTIssuer:         defaultJWTIssuer,
+		JWTAudience:       defaultJWTAudience,
+		JWTLeeway:         defaultJWTLeeway,
+		RateLimit:         defaultRateLimit,
+		RateLimitWindow:   defaultRateWindow,
 	}
 }
 
@@ -97,6 +114,34 @@ func ConfigFromEnv() (Config, error) {
 			return Config{}, fmt.Errorf("parse FORGEFLOW_SHUTDOWN_TIMEOUT: %w", err)
 		}
 		config.ShutdownTimeout = shutdownTimeout
+	}
+	config.JWTPublicKeyPEM = strings.TrimSpace(os.Getenv("FORGEFLOW_JWT_PUBLIC_KEY"))
+	if value := strings.TrimSpace(os.Getenv("FORGEFLOW_JWT_ISSUER")); value != "" {
+		config.JWTIssuer = value
+	}
+	if value := strings.TrimSpace(os.Getenv("FORGEFLOW_JWT_AUDIENCE")); value != "" {
+		config.JWTAudience = value
+	}
+	if value := strings.TrimSpace(os.Getenv("FORGEFLOW_JWT_LEEWAY")); value != "" {
+		leeway, err := time.ParseDuration(value)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse FORGEFLOW_JWT_LEEWAY: %w", err)
+		}
+		config.JWTLeeway = leeway
+	}
+	if value := strings.TrimSpace(os.Getenv("FORGEFLOW_RATE_LIMIT")); value != "" {
+		limit, err := strconv.Atoi(value)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse FORGEFLOW_RATE_LIMIT: %w", err)
+		}
+		config.RateLimit = limit
+	}
+	if value := strings.TrimSpace(os.Getenv("FORGEFLOW_RATE_LIMIT_WINDOW")); value != "" {
+		window, err := time.ParseDuration(value)
+		if err != nil {
+			return Config{}, fmt.Errorf("parse FORGEFLOW_RATE_LIMIT_WINDOW: %w", err)
+		}
+		config.RateLimitWindow = window
 	}
 	if err := config.Validate(); err != nil {
 		return Config{}, err
@@ -140,6 +185,16 @@ func (config Config) Validate() error {
 	if config.ShutdownTimeout <= 0 {
 		return errors.New("ForgeFlow shutdown timeout must be positive")
 	}
+	if strings.TrimSpace(config.JWTPublicKeyPEM) == "" || strings.TrimSpace(config.JWTIssuer) == "" ||
+		strings.TrimSpace(config.JWTAudience) == "" {
+		return errors.New("ForgeFlow JWT public key, issuer, and audience must not be empty")
+	}
+	if config.JWTLeeway < 0 {
+		return errors.New("ForgeFlow JWT leeway must not be negative")
+	}
+	if config.RateLimit < 1 || config.RateLimitWindow <= 0 {
+		return errors.New("ForgeFlow rate limit and window must be positive")
+	}
 	return nil
 }
 
@@ -169,10 +224,25 @@ func Run(ctx context.Context, config Config, output io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("run ForgeFlow: create handler registry: %w", err)
 	}
+	auth, err := security.NewJWTAuthenticator(security.JWTConfig{
+		PublicKeyPEM: config.JWTPublicKeyPEM,
+		Issuer:       config.JWTIssuer,
+		Audience:     config.JWTAudience,
+		Leeway:       config.JWTLeeway,
+	})
+	if err != nil {
+		return fmt.Errorf("run ForgeFlow: configure JWT authentication: %w", err)
+	}
+	limiter, err := security.NewFixedWindowRateLimiter(config.RateLimit, config.RateLimitWindow, nil)
+	if err != nil {
+		return fmt.Errorf("run ForgeFlow: configure API rate limit: %w", err)
+	}
 	apiServer, err := api.NewServer(
 		store,
 		registry,
 		config.WorkerCount,
+		auth,
+		limiter,
 		execution.WithBroker(taskBroker),
 	)
 	if err != nil {
@@ -249,7 +319,7 @@ func openBroker(ctx context.Context, config Config) (broker.Broker, func(), erro
 	}
 }
 
-func openStore(ctx context.Context, config Config) (execution.Store, func(), error) {
+func openStore(ctx context.Context, config Config) (security.Store, func(), error) {
 	switch config.StoreBackend {
 	case "file":
 		store, err := persistence.OpenFileStore(config.DataPath)

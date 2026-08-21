@@ -15,6 +15,7 @@ import (
 
 	"github.com/vijaypratap3364/forgeflow/internal/execution"
 	"github.com/vijaypratap3364/forgeflow/internal/persistence"
+	"github.com/vijaypratap3364/forgeflow/internal/security"
 )
 
 func TestHealthReadinessAndStructuredRoutingErrors(t *testing.T) {
@@ -135,6 +136,7 @@ func TestWorkflowSubmissionValidationAndRetrieval(t *testing.T) {
 
 	body := `{
 		"id":"text-pipeline",
+		"project_id":"project-main",
 		"tasks":[
 			{"id":"transform","name":"Uppercase","handler":"uppercase","input":"hello","dependencies":["start"],"retry":{"max_attempts":3,"initial_backoff":"10ms","max_backoff":"20ms"}},
 			{"id":"start","name":"Start","handler":"noop"}
@@ -197,6 +199,7 @@ func TestWorkflowRunLifecycleTasksAndSSE(t *testing.T) {
 		t.Fatalf("SSE event types = %v, want %v\nstream:\n%s", eventTypes, wantEvents, eventBody)
 	}
 	replayRequest := httptest.NewRequest(http.MethodGet, "/api/v1/runs/api-run-1/events", nil)
+	replayRequest.Header.Set("Authorization", "Bearer test-token")
 	replayRequest.Header.Set("Last-Event-ID", "3")
 	replay := httptest.NewRecorder()
 	server.ServeHTTP(replay, replayRequest)
@@ -336,6 +339,7 @@ func TestRunEventStreamStopsOnClientDisconnect(t *testing.T) {
 		"/api/v1/runs/disconnect-run/events",
 		nil,
 	).WithContext(streamContext)
+	streamRequest.Header.Set("Authorization", "Bearer test-token")
 	streamWriter := newFlushSignalRecorder()
 	streamReturned := make(chan struct{})
 	go func() {
@@ -461,7 +465,22 @@ func newTestServer(
 	if configure != nil {
 		configure(registry)
 	}
-	server, err := NewServer(store, registry, 2)
+	now := time.Date(2026, 8, 21, 0, 0, 0, 0, time.UTC)
+	user := security.User{ID: "test-admin", DisplayName: "Test Admin", CreatedAt: now}
+	project := security.Project{ID: "project-main", Name: "Test Project", CreatedBy: user.ID, CreatedAt: now, UpdatedAt: now}
+	membership := security.Membership{ProjectID: project.ID, UserID: user.ID, Role: security.RoleAdmin, CreatedAt: now, UpdatedAt: now}
+	event := security.AuditEvent{ID: "bootstrap-audit", ProjectID: project.ID, ActorUserID: user.ID,
+		Action: "project.created", ResourceType: "project", ResourceID: string(project.ID), OccurredAt: now}
+	if err := store.CreateProject(context.Background(), user, project, membership, event); err != nil {
+		t.Fatalf("CreateProject() error = %v", err)
+	}
+	limiter, err := security.NewFixedWindowRateLimiter(10000, time.Hour, nil)
+	if err != nil {
+		t.Fatalf("NewFixedWindowRateLimiter() error = %v", err)
+	}
+	server, err := NewServer(store, registry, 2, staticAuthenticator{principal: security.Principal{
+		UserID: user.ID, DisplayName: user.DisplayName,
+	}}, limiter)
 	if err != nil {
 		t.Fatalf("NewServer() error = %v", err)
 	}
@@ -477,7 +496,16 @@ func newTestServer(
 
 func submitWorkflow(t *testing.T, server http.Handler, body string) {
 	t.Helper()
-	response := request(t, server, http.MethodPost, "/api/v1/workflows", body, "application/json")
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(body), &payload); err != nil {
+		t.Fatalf("decode submitWorkflow body: %v", err)
+	}
+	payload["project_id"] = "project-main"
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("encode submitWorkflow body: %v", err)
+	}
+	response := request(t, server, http.MethodPost, "/api/v1/workflows", string(encoded), "application/json")
 	assertStatus(t, response, http.StatusCreated)
 }
 
@@ -495,12 +523,22 @@ func request(
 		reader = strings.NewReader(body)
 	}
 	httpRequest := httptest.NewRequest(method, path, reader)
+	httpRequest.Header.Set("Authorization", "Bearer test-token")
 	if contentType != "" {
 		httpRequest.Header.Set("Content-Type", contentType)
 	}
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, httpRequest)
 	return recorder
+}
+
+type staticAuthenticator struct {
+	principal security.Principal
+	err       error
+}
+
+func (auth staticAuthenticator) Authenticate(context.Context, string) (security.Principal, error) {
+	return auth.principal, auth.err
 }
 
 func waitForEventStream(t *testing.T, handler http.Handler, runID string) string {

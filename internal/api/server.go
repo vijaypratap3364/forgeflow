@@ -19,6 +19,7 @@ import (
 	"unicode"
 
 	"github.com/vijaypratap3364/forgeflow/internal/execution"
+	"github.com/vijaypratap3364/forgeflow/internal/security"
 	"github.com/vijaypratap3364/forgeflow/internal/workflow"
 )
 
@@ -29,20 +30,25 @@ const (
 
 // Server owns the HTTP handler, asynchronous run lifecycle, and live event broker.
 type Server struct {
-	store      execution.Store
-	registry   *execution.HandlerRegistry
-	manager    *runManager
-	broker     *eventBroker
-	mux        *http.ServeMux
-	workflowMu sync.Mutex
-	ready      atomic.Bool
+	store          security.Store
+	executionStore execution.Store
+	auth           security.Authenticator
+	limiter        security.RateLimiter
+	registry       *execution.HandlerRegistry
+	manager        *runManager
+	broker         *eventBroker
+	mux            *http.ServeMux
+	workflowMu     sync.Mutex
+	ready          atomic.Bool
 }
 
 // NewServer creates an HTTP API around a Store and safe task-handler registry.
 func NewServer(
-	store execution.Store,
+	store security.Store,
 	registry *execution.HandlerRegistry,
 	workerCount int,
+	auth security.Authenticator,
+	limiter security.RateLimiter,
 	engineOptions ...execution.EngineOption,
 ) (*Server, error) {
 	if store == nil {
@@ -51,6 +57,12 @@ func NewServer(
 	if registry == nil {
 		return nil, errors.New("create API server: handler registry must not be nil")
 	}
+	if auth == nil {
+		return nil, errors.New("create API server: authenticator must not be nil")
+	}
+	if limiter == nil {
+		return nil, errors.New("create API server: rate limiter must not be nil")
+	}
 	broker := newEventBroker()
 	observed := &observedStore{delegate: store, observe: broker.observe}
 	engine, err := execution.NewEngine(workerCount, registry, observed, engineOptions...)
@@ -58,11 +70,14 @@ func NewServer(
 		return nil, fmt.Errorf("create API execution engine: %w", err)
 	}
 	server := &Server{
-		store:    observed,
-		registry: registry,
-		manager:  newRunManager(engine),
-		broker:   broker,
-		mux:      http.NewServeMux(),
+		store:          store,
+		executionStore: observed,
+		auth:           auth,
+		limiter:        limiter,
+		registry:       registry,
+		manager:        newRunManager(engine),
+		broker:         broker,
+		mux:            http.NewServeMux(),
 	}
 	server.routes()
 	server.ready.Store(true)
@@ -71,6 +86,28 @@ func NewServer(
 
 // ServeHTTP dispatches one ForgeFlow API request.
 func (server *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
+	if strings.HasPrefix(request.URL.Path, "/api/v1/") || request.URL.Path == "/api/v1" {
+		principal, err := server.auth.Authenticate(request.Context(), bearerToken(request.Header.Get("Authorization")))
+		if err != nil {
+			writer.Header().Set("WWW-Authenticate", `Bearer realm="forgeflow"`)
+			writeAPIError(writer, http.StatusUnauthorized, "unauthenticated", "a valid bearer token is required", "")
+			return
+		}
+		decision := server.limiter.Allow(string(principal.UserID))
+		writer.Header().Set("RateLimit-Limit", strconv.Itoa(decision.Limit))
+		writer.Header().Set("RateLimit-Remaining", strconv.Itoa(decision.Remaining))
+		writer.Header().Set("RateLimit-Reset", strconv.FormatInt(decision.ResetAt.Unix(), 10))
+		if !decision.Allowed {
+			retryAfter := int((decision.RetryAfter + time.Second - 1) / time.Second)
+			if retryAfter < 1 {
+				retryAfter = 1
+			}
+			writer.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+			writeAPIError(writer, http.StatusTooManyRequests, "rate_limited", "request rate limit exceeded", "")
+			return
+		}
+		request = request.WithContext(withPrincipal(request.Context(), principal))
+	}
 	server.mux.ServeHTTP(writer, request)
 }
 
@@ -93,12 +130,18 @@ func (server *Server) Shutdown(ctx context.Context) error {
 func (server *Server) routes() {
 	server.mux.HandleFunc("/healthz", server.handleHealth)
 	server.mux.HandleFunc("/readyz", server.handleReady)
+	server.mux.HandleFunc("/api/v1/projects", server.handleProjects)
+	server.mux.HandleFunc("/api/v1/projects/{projectID}", server.handleProject)
+	server.mux.HandleFunc("/api/v1/projects/{projectID}/members", server.handleProjectMembers)
+	server.mux.HandleFunc("/api/v1/projects/{projectID}/members/{userID}", server.handleProjectMember)
+	server.mux.HandleFunc("/api/v1/projects/{projectID}/audit-events", server.handleProjectAuditEvents)
 	server.mux.HandleFunc("/api/v1/workflows", server.handleWorkflows)
 	server.mux.HandleFunc("/api/v1/workflows/{id}", server.handleWorkflow)
 	server.mux.HandleFunc("/api/v1/workflows/{id}/runs", server.handleWorkflowRuns)
 	server.mux.HandleFunc("/api/v1/runs/{runID}", server.handleRun)
 	server.mux.HandleFunc("/api/v1/runs/{runID}/tasks", server.handleRunTasks)
 	server.mux.HandleFunc("/api/v1/runs/{runID}/cancel", server.handleRunCancellation)
+	server.mux.HandleFunc("/api/v1/runs/{runID}/retry", server.handleRunRetry)
 	server.mux.HandleFunc("/api/v1/runs/{runID}/events", server.handleRunEvents)
 	server.mux.HandleFunc("/", server.handleNotFound)
 }
@@ -149,6 +192,18 @@ func (server *Server) handleWorkflows(writer http.ResponseWriter, request *http.
 		writeRequestError(writer, err)
 		return
 	}
+	projectID := security.ProjectID(payload.ProjectID)
+	if !validResourceID(string(projectID)) {
+		writeAPIError(writer, http.StatusUnprocessableEntity, "invalid_project_id", "project ID is invalid", "project_id")
+		return
+	}
+	principal := mustPrincipal(request.Context())
+	if !server.authorizeProject(writer, request, projectID, security.PermissionWorkflowWrite) {
+		return
+	}
+	ownership := security.WorkflowOwnership{
+		WorkflowID: definition.ID, ProjectID: projectID, OwnerUserID: principal.UserID, CreatedAt: time.Now().UTC(),
+	}
 
 	server.workflowMu.Lock()
 	defer server.workflowMu.Unlock()
@@ -161,12 +216,12 @@ func (server *Server) handleWorkflows(writer http.ResponseWriter, request *http.
 		writeAPIError(writer, http.StatusConflict, "workflow_exists", "workflow already exists", "id")
 		return
 	}
-	if err := server.store.SaveWorkflow(request.Context(), definition); err != nil {
+	if err := server.store.SaveWorkflowForProject(request.Context(), definition, ownership); err != nil {
 		writeStoreError(writer, err)
 		return
 	}
 	writer.Header().Set("Location", "/api/v1/workflows/"+string(definition.ID))
-	writeJSON(writer, http.StatusCreated, workflowDTO(definition))
+	writeJSON(writer, http.StatusCreated, workflowDTO(definition, ownership))
 }
 
 func (server *Server) handleWorkflow(writer http.ResponseWriter, request *http.Request) {
@@ -187,7 +242,18 @@ func (server *Server) handleWorkflow(writer http.ResponseWriter, request *http.R
 		writeAPIError(writer, http.StatusNotFound, "workflow_not_found", "workflow was not found", "id")
 		return
 	}
-	writeJSON(writer, http.StatusOK, workflowDTO(definition))
+	ownership, found, err := server.store.LoadWorkflowOwnership(request.Context(), workflowID)
+	if err != nil {
+		writeStoreError(writer, err)
+		return
+	}
+	if !found || !server.authorizeProject(writer, request, ownership.ProjectID, security.PermissionProjectRead) {
+		if !found {
+			writeAPIError(writer, http.StatusNotFound, "workflow_not_found", "workflow was not found", "id")
+		}
+		return
+	}
+	writeJSON(writer, http.StatusOK, workflowDTO(definition, ownership))
 }
 
 func (server *Server) handleWorkflowRuns(writer http.ResponseWriter, request *http.Request) {
@@ -206,6 +272,17 @@ func (server *Server) handleWorkflowRuns(writer http.ResponseWriter, request *ht
 	}
 	if !found {
 		writeAPIError(writer, http.StatusNotFound, "workflow_not_found", "workflow was not found", "id")
+		return
+	}
+	ownership, found, err := server.store.LoadWorkflowOwnership(request.Context(), workflowID)
+	if err != nil {
+		writeStoreError(writer, err)
+		return
+	}
+	if !found || !server.authorizeProject(writer, request, ownership.ProjectID, security.PermissionRunStart) {
+		if !found {
+			writeAPIError(writer, http.StatusNotFound, "workflow_not_found", "workflow was not found", "id")
+		}
 		return
 	}
 	if err := server.validateHandlers(definition); err != nil {
@@ -234,7 +311,7 @@ func (server *Server) handleWorkflowRuns(writer http.ResponseWriter, request *ht
 		writeRequestError(writer, err)
 		return
 	}
-	stored, err := server.store.CreateRun(request.Context(), run.Snapshot())
+	stored, err := server.executionStore.CreateRun(request.Context(), run.Snapshot())
 	if err != nil {
 		writeStoreError(writer, err)
 		return
@@ -255,7 +332,7 @@ func (server *Server) handleRun(writer http.ResponseWriter, request *http.Reques
 	if !requireMethod(writer, request, http.MethodGet) {
 		return
 	}
-	snapshot, found := server.loadRun(writer, request)
+	snapshot, found := server.loadRun(writer, request, security.PermissionRunRead)
 	if !found {
 		return
 	}
@@ -266,7 +343,7 @@ func (server *Server) handleRunTasks(writer http.ResponseWriter, request *http.R
 	if !requireMethod(writer, request, http.MethodGet) {
 		return
 	}
-	snapshot, found := server.loadRun(writer, request)
+	snapshot, found := server.loadRun(writer, request, security.PermissionTaskRead)
 	if !found {
 		return
 	}
@@ -277,7 +354,7 @@ func (server *Server) handleRunCancellation(writer http.ResponseWriter, request 
 	if !requireMethod(writer, request, http.MethodPost) {
 		return
 	}
-	snapshot, found := server.loadRun(writer, request)
+	snapshot, found := server.loadRun(writer, request, security.PermissionRunOperate)
 	if !found {
 		return
 	}
@@ -298,11 +375,68 @@ func (server *Server) handleRunCancellation(writer http.ResponseWriter, request 
 	})
 }
 
+// handleRunRetry creates a fresh execution of a failed or canceled workflow.
+// It never rewinds the immutable history of the source run.
+func (server *Server) handleRunRetry(writer http.ResponseWriter, request *http.Request) {
+	if !requireMethod(writer, request, http.MethodPost) {
+		return
+	}
+	source, found := server.loadRun(writer, request, security.PermissionRunOperate)
+	if !found {
+		return
+	}
+	if source.Status != execution.WorkflowRunFailed && source.Status != execution.WorkflowRunCanceled {
+		writeAPIError(writer, http.StatusConflict, "run_not_retryable", "only failed or canceled runs can be retried", "runID")
+		return
+	}
+	definition, found, err := server.store.LoadWorkflow(request.Context(), source.WorkflowID)
+	if err != nil {
+		writeStoreError(writer, err)
+		return
+	}
+	if !found {
+		writeAPIError(writer, http.StatusNotFound, "workflow_not_found", "workflow was not found", "")
+		return
+	}
+	var payload CreateRunRequest
+	if !decodeOptionalJSONBody(writer, request, &payload) {
+		return
+	}
+	runID := execution.RunID(payload.RunID)
+	if runID == "" {
+		runID, err = generateRunID()
+		if err != nil {
+			writeAPIError(writer, http.StatusInternalServerError, "internal_error", "could not generate a workflow run ID", "")
+			return
+		}
+	}
+	if !validResourceID(string(runID)) {
+		writeAPIError(writer, http.StatusBadRequest, "invalid_run_id", "run ID is invalid", "run_id")
+		return
+	}
+	run, err := execution.NewWorkflowRun(runID, definition)
+	if err != nil {
+		writeRequestError(writer, err)
+		return
+	}
+	stored, err := server.executionStore.CreateRun(request.Context(), run.Snapshot())
+	if err != nil {
+		writeStoreError(writer, err)
+		return
+	}
+	if err := server.manager.start(runID); err != nil {
+		writeAPIError(writer, http.StatusServiceUnavailable, "not_ready", "workflow retry cannot start", "")
+		return
+	}
+	writer.Header().Set("Location", "/api/v1/runs/"+string(runID))
+	writeJSON(writer, http.StatusAccepted, runDTO(stored))
+}
+
 func (server *Server) handleRunEvents(writer http.ResponseWriter, request *http.Request) {
 	if !requireMethod(writer, request, http.MethodGet) {
 		return
 	}
-	snapshot, found := server.loadRun(writer, request)
+	snapshot, found := server.loadRun(writer, request, security.PermissionRunRead)
 	if !found {
 		return
 	}
@@ -362,6 +496,7 @@ func (server *Server) handleNotFound(writer http.ResponseWriter, _ *http.Request
 func (server *Server) loadRun(
 	writer http.ResponseWriter,
 	request *http.Request,
+	permission security.Permission,
 ) (execution.WorkflowRunSnapshot, bool) {
 	runID := execution.RunID(request.PathValue("runID"))
 	if !validResourceID(string(runID)) {
@@ -375,6 +510,17 @@ func (server *Server) loadRun(
 	}
 	if !found {
 		writeAPIError(writer, http.StatusNotFound, "run_not_found", "workflow run was not found", "runID")
+		return execution.WorkflowRunSnapshot{}, false
+	}
+	ownership, found, err := server.store.LoadWorkflowOwnership(request.Context(), snapshot.WorkflowID)
+	if err != nil {
+		writeStoreError(writer, err)
+		return execution.WorkflowRunSnapshot{}, false
+	}
+	if !found || !server.authorizeProject(writer, request, ownership.ProjectID, permission) {
+		if !found {
+			writeAPIError(writer, http.StatusNotFound, "run_not_found", "workflow run was not found", "runID")
+		}
 		return execution.WorkflowRunSnapshot{}, false
 	}
 	return snapshot, true
@@ -396,11 +542,16 @@ func (server *Server) validateHandlers(definition workflow.WorkflowDefinition) e
 }
 
 func generateRunID() (execution.RunID, error) {
+	id, err := generateRandomID("run-")
+	return execution.RunID(id), err
+}
+
+func generateRandomID(prefix string) (string, error) {
 	bytes := make([]byte, 12)
 	if _, err := rand.Read(bytes); err != nil {
-		return "", fmt.Errorf("generate run ID: %w", err)
+		return "", fmt.Errorf("generate random ID: %w", err)
 	}
-	return execution.RunID("run-" + hex.EncodeToString(bytes)), nil
+	return prefix + hex.EncodeToString(bytes), nil
 }
 
 func lastEventSequence(value string) (uint64, error) {
@@ -502,17 +653,36 @@ func writeRequestError(writer http.ResponseWriter, err error) {
 func writeStoreError(writer http.ResponseWriter, err error) {
 	var conflictError *execution.WorkflowConflictError
 	var runExistsError *execution.RunAlreadyExistsError
+	var ownershipConflict *security.WorkflowOwnershipConflictError
+	var disabledUser *security.UserDisabledError
 	switch {
 	case errors.As(err, &conflictError):
 		writeAPIError(writer, http.StatusConflict, "workflow_conflict", conflictError.Error(), "id")
 	case errors.As(err, &runExistsError):
 		writeAPIError(writer, http.StatusConflict, "run_exists", runExistsError.Error(), "run_id")
+	case errors.As(err, &ownershipConflict):
+		writeAPIError(writer, http.StatusConflict, "workflow_ownership_conflict", ownershipConflict.Error(), "id")
+	case errors.As(err, &disabledUser):
+		writeAPIError(writer, http.StatusForbidden, "user_disabled", disabledUser.Error(), "")
 	case errors.Is(err, context.DeadlineExceeded):
 		writeAPIError(writer, http.StatusRequestTimeout, "request_timeout", "request deadline expired", "")
 	case errors.Is(err, context.Canceled):
 		writeAPIError(writer, http.StatusRequestTimeout, "request_canceled", "request was canceled", "")
 	default:
 		writeAPIError(writer, http.StatusInternalServerError, "internal_error", "durable state operation failed", "")
+	}
+}
+
+func writeRequestOrStoreError(writer http.ResponseWriter, err error) {
+	var projectNotFound *security.ProjectNotFoundError
+	var auditConflict *security.AuditEventAlreadyExistsError
+	switch {
+	case errors.As(err, &projectNotFound):
+		writeAPIError(writer, http.StatusNotFound, "project_not_found", projectNotFound.Error(), "project_id")
+	case errors.As(err, &auditConflict):
+		writeAPIError(writer, http.StatusConflict, "audit_conflict", auditConflict.Error(), "")
+	default:
+		writeStoreError(writer, err)
 	}
 }
 

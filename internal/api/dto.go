@@ -7,13 +7,15 @@ import (
 	"time"
 
 	"github.com/vijaypratap3364/forgeflow/internal/execution"
+	"github.com/vijaypratap3364/forgeflow/internal/security"
 	"github.com/vijaypratap3364/forgeflow/internal/workflow"
 )
 
 // WorkflowRequest is the transport representation used to create a workflow.
 type WorkflowRequest struct {
-	ID    string        `json:"id"`
-	Tasks []TaskRequest `json:"tasks"`
+	ID        string        `json:"id"`
+	ProjectID string        `json:"project_id"`
+	Tasks     []TaskRequest `json:"tasks"`
 }
 
 // TaskRequest is the transport representation of one workflow task.
@@ -35,8 +37,10 @@ type RetryPolicyRequest struct {
 
 // WorkflowResponse is the normalized API representation of a workflow.
 type WorkflowResponse struct {
-	ID    workflow.WorkflowID `json:"id"`
-	Tasks []TaskResponse      `json:"tasks"`
+	ID          workflow.WorkflowID `json:"id"`
+	ProjectID   security.ProjectID  `json:"project_id"`
+	OwnerUserID security.UserID     `json:"owner_user_id"`
+	Tasks       []TaskResponse      `json:"tasks"`
 }
 
 // TaskResponse is the normalized API representation of a task definition.
@@ -198,12 +202,14 @@ func parseDurationField(field, value string) (time.Duration, error) {
 	return duration, nil
 }
 
-func workflowDTO(definition workflow.WorkflowDefinition) WorkflowResponse {
+func workflowDTO(definition workflow.WorkflowDefinition, ownership security.WorkflowOwnership) WorkflowResponse {
 	tasks := append([]workflow.TaskDefinition(nil), definition.Tasks...)
 	sort.Slice(tasks, func(left, right int) bool { return tasks[left].ID < tasks[right].ID })
 	response := WorkflowResponse{
-		ID:    definition.ID,
-		Tasks: make([]TaskResponse, 0, len(tasks)),
+		ID:          definition.ID,
+		ProjectID:   ownership.ProjectID,
+		OwnerUserID: ownership.OwnerUserID,
+		Tasks:       make([]TaskResponse, 0, len(tasks)),
 	}
 	for _, task := range tasks {
 		dependencies := append([]workflow.TaskID(nil), task.Dependencies...)

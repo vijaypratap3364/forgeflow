@@ -3,6 +3,10 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"strings"
 	"sync"
 	"testing"
@@ -10,6 +14,7 @@ import (
 )
 
 func TestConfigFromEnv(t *testing.T) {
+	publicKey := testPublicKeyPEM(t)
 	t.Setenv("FORGEFLOW_ADDR", "127.0.0.1:9090")
 	t.Setenv("FORGEFLOW_STORE", "postgres")
 	t.Setenv("FORGEFLOW_DATA_PATH", "custom.ffdb")
@@ -20,6 +25,12 @@ func TestConfigFromEnv(t *testing.T) {
 	t.Setenv("FORGEFLOW_NATS_SUBJECT_PREFIX", "forgeflow.test.tasks")
 	t.Setenv("FORGEFLOW_WORKERS", "2")
 	t.Setenv("FORGEFLOW_SHUTDOWN_TIMEOUT", "3s")
+	t.Setenv("FORGEFLOW_JWT_PUBLIC_KEY", publicKey)
+	t.Setenv("FORGEFLOW_JWT_ISSUER", "https://issuer.example")
+	t.Setenv("FORGEFLOW_JWT_AUDIENCE", "forgeflow-test")
+	t.Setenv("FORGEFLOW_JWT_LEEWAY", "5s")
+	t.Setenv("FORGEFLOW_RATE_LIMIT", "25")
+	t.Setenv("FORGEFLOW_RATE_LIMIT_WINDOW", "30s")
 
 	config, err := ConfigFromEnv()
 	if err != nil {
@@ -29,7 +40,9 @@ func TestConfigFromEnv(t *testing.T) {
 		config.DataPath != "custom.ffdb" || config.PostgresDSN != "postgres://forgeflow.example/forgeflow" ||
 		config.BrokerBackend != "nats" || config.NATSURL != "nats://forgeflow.example:4222" ||
 		config.NATSStreamName != "FORGEFLOW_TEST_TASKS" || config.NATSSubjectPrefix != "forgeflow.test.tasks" ||
-		config.WorkerCount != 2 || config.ShutdownTimeout != 3*time.Second {
+		config.WorkerCount != 2 || config.ShutdownTimeout != 3*time.Second || config.JWTPublicKeyPEM != strings.TrimSpace(publicKey) ||
+		config.JWTIssuer != "https://issuer.example" || config.JWTAudience != "forgeflow-test" ||
+		config.JWTLeeway != 5*time.Second || config.RateLimit != 25 || config.RateLimitWindow != 30*time.Second {
 		t.Fatalf("ConfigFromEnv() = %#v", config)
 	}
 }
@@ -72,11 +85,18 @@ func TestConfigValidateStoreRequirements(t *testing.T) {
 				config.NATSStreamName = "forgeflow.tasks"
 			},
 		},
+		{
+			name: "JWT public key missing",
+			mutate: func(config *Config) {
+				config.JWTPublicKeyPEM = ""
+			},
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 			config := DefaultConfig()
+			config.JWTPublicKeyPEM = testPublicKeyPEM(t)
 			test.mutate(&config)
 			if err := config.Validate(); err == nil {
 				t.Fatal("Config.Validate() error = nil")
@@ -101,6 +121,7 @@ func TestRunStartsAndGracefullyStops(t *testing.T) {
 	config.Address = "127.0.0.1:0"
 	config.DataPath = t.TempDir() + "/forgeflow.ffdb"
 	config.ShutdownTimeout = 3 * time.Second
+	config.JWTPublicKeyPEM = testPublicKeyPEM(t)
 
 	go func() {
 		result <- Run(ctx, config, output)
@@ -121,6 +142,19 @@ func TestRunStartsAndGracefullyStops(t *testing.T) {
 	case <-timer.C:
 		t.Fatal("Run() did not stop after context cancellation")
 	}
+}
+
+func testPublicKeyPEM(t *testing.T) string {
+	t.Helper()
+	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey() error = %v", err)
+	}
+	encoded, err := x509.MarshalPKIXPublicKey(publicKey)
+	if err != nil {
+		t.Fatalf("MarshalPKIXPublicKey() error = %v", err)
+	}
+	return string(pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: encoded}))
 }
 
 type signalWriter struct {
