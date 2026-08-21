@@ -55,7 +55,9 @@ func TestPostgresStoreProjectAuthorizationContract(t *testing.T) {
 		t.Fatalf("SaveWorkflowForProject() error = %v", err)
 	}
 	gotOwnership, found, err := store.LoadWorkflowOwnership(ctx, definition.ID)
-	if err != nil || !found || gotOwnership != ownership {
+	if err != nil || !found || gotOwnership.WorkflowID != ownership.WorkflowID ||
+		gotOwnership.ProjectID != ownership.ProjectID || gotOwnership.OwnerUserID != ownership.OwnerUserID ||
+		!gotOwnership.CreatedAt.Equal(ownership.CreatedAt) {
 		t.Fatalf("LoadWorkflowOwnership() = %#v, %v, %v; want %#v, true, nil", gotOwnership, found, err, ownership)
 	}
 	memberships, err := store.ListMemberships(ctx, project.ID)
