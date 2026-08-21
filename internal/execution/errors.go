@@ -133,6 +133,26 @@ func (e *RunNotFoundError) Error() string {
 	return fmt.Sprintf("workflow run %q was not found", e.RunID)
 }
 
+// PersistenceError reports a store operation that prevented durable progress.
+type PersistenceError struct {
+	Operation string
+	RunID     RunID
+	Cause     error
+}
+
+// Error returns a contextual description of the failed durable operation.
+func (e *PersistenceError) Error() string {
+	if e.RunID == "" {
+		return fmt.Sprintf("persistence operation %q failed: %v", e.Operation, e.Cause)
+	}
+	return fmt.Sprintf("persistence operation %q failed for workflow run %q: %v", e.Operation, e.RunID, e.Cause)
+}
+
+// Unwrap exposes the repository error for errors.Is and errors.As.
+func (e *PersistenceError) Unwrap() error {
+	return e.Cause
+}
+
 // UnknownTaskRunError reports a task ID that is not part of an execution.
 type UnknownTaskRunError struct {
 	RunID  RunID

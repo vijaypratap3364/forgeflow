@@ -308,16 +308,20 @@ func TestEngineRejectsInvalidConfigurationAndUnknownHandler(t *testing.T) {
 	t.Parallel()
 
 	for _, workerCount := range []int{-1, 0} {
-		_, err := NewEngine(workerCount, NewHandlerRegistry())
+		_, err := NewEngine(workerCount, NewHandlerRegistry(), newMemoryTestStore())
 		var configError *InvalidEngineConfigError
 		if !errors.As(err, &configError) {
 			t.Fatalf("NewEngine(%d) error = %v, want *InvalidEngineConfigError", workerCount, err)
 		}
 	}
-	_, err := NewEngine(1, nil)
+	_, err := NewEngine(1, nil, newMemoryTestStore())
 	var configError *InvalidEngineConfigError
 	if !errors.As(err, &configError) {
 		t.Fatalf("NewEngine(nil registry) error = %v, want *InvalidEngineConfigError", err)
+	}
+	_, err = NewEngine(1, NewHandlerRegistry(), nil)
+	if !errors.As(err, &configError) {
+		t.Fatalf("NewEngine(nil store) error = %v, want *InvalidEngineConfigError", err)
 	}
 
 	engine := mustEngine(t, 1, NewHandlerRegistry())
@@ -363,6 +367,124 @@ func TestEngineHandlesContextCanceledBeforeExecution(t *testing.T) {
 	}
 }
 
+func TestEnginePersistsCompletedRun(t *testing.T) {
+	t.Parallel()
+
+	store := newMemoryTestStore()
+	registry := NewHandlerRegistry()
+	if err := registry.Register("complete", TaskHandlerFunc(func(_ context.Context, request TaskRequest) (string, error) {
+		return "output-" + string(request.Task.ID), nil
+	})); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	engine := mustEngineWithStore(t, 2, registry, store)
+	definition := executionWorkflow(
+		executionTask("a", "complete", ""),
+		executionTask("b", "complete", "", "a"),
+	)
+
+	run, err := engine.Execute(context.Background(), "persisted-run", definition)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	snapshot, found, err := store.LoadRun(context.Background(), run.ID())
+	if err != nil || !found {
+		t.Fatalf("LoadRun() = found %v, error %v", found, err)
+	}
+	if !reflect.DeepEqual(snapshot, run.Snapshot()) {
+		t.Fatalf("persisted snapshot = %#v, want %#v", snapshot, run.Snapshot())
+	}
+	if snapshot.Status != WorkflowRunSucceeded {
+		t.Fatalf("persisted status = %q, want %q", snapshot.Status, WorkflowRunSucceeded)
+	}
+	for _, task := range snapshot.Tasks {
+		if task.AttemptCount != 1 || task.StartedAt.IsZero() || task.FinishedAt.IsZero() {
+			t.Fatalf("persisted task attempt metadata is incomplete: %#v", task)
+		}
+	}
+}
+
+func TestEngineRecoverReexecutesInterruptedRunningTask(t *testing.T) {
+	t.Parallel()
+
+	store := newMemoryTestStore()
+	registry := NewHandlerRegistry()
+	var calls atomic.Int32
+	if err := registry.Register("recover", TaskHandlerFunc(func(context.Context, TaskRequest) (string, error) {
+		calls.Add(1)
+		return "recovered", nil
+	})); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	definition := executionWorkflow(executionTask("a", "recover", ""))
+	if err := store.SaveWorkflow(context.Background(), definition); err != nil {
+		t.Fatalf("SaveWorkflow() error = %v", err)
+	}
+	run := mustWorkflowRun(t, definition)
+	snapshot := run.Snapshot()
+	interruptedAt := snapshot.CreatedAt.Add(time.Second)
+	snapshot.Status = WorkflowRunRunning
+	snapshot.UpdatedAt = interruptedAt
+	snapshot.Tasks[0].Status = TaskRunRunning
+	snapshot.Tasks[0].AttemptCount = 1
+	snapshot.Tasks[0].UpdatedAt = interruptedAt
+	snapshot.Tasks[0].StartedAt = interruptedAt
+	if err := store.CreateRun(context.Background(), snapshot); err != nil {
+		t.Fatalf("CreateRun() error = %v", err)
+	}
+
+	engine := mustEngineWithStore(t, 1, registry, store)
+	recovered, err := engine.Recover(context.Background(), snapshot.ID)
+	if err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if recovered.Status() != WorkflowRunSucceeded {
+		t.Fatalf("Status() = %q, want %q", recovered.Status(), WorkflowRunSucceeded)
+	}
+	task := requireTaskRun(t, recovered, "a")
+	if task.AttemptCount != 2 {
+		t.Fatalf("AttemptCount = %d, want 2", task.AttemptCount)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("recovery handler calls = %d, want 1", got)
+	}
+}
+
+func TestEngineRecoverReturnsTerminalRunWithoutResolvingHandlers(t *testing.T) {
+	t.Parallel()
+
+	store := newMemoryTestStore()
+	registry := NewHandlerRegistry()
+	if err := registry.Register("complete", NoopHandler{}); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	definition := executionWorkflow(executionTask("a", "complete", ""))
+	engine := mustEngineWithStore(t, 1, registry, store)
+	completed, err := engine.Execute(context.Background(), "terminal-run", definition)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	recoveryEngine := mustEngineWithStore(t, 1, NewHandlerRegistry(), store)
+	recovered, err := recoveryEngine.Recover(context.Background(), completed.ID())
+	if err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if !reflect.DeepEqual(recovered.Snapshot(), completed.Snapshot()) {
+		t.Fatalf("recovered terminal snapshot = %#v, want %#v", recovered.Snapshot(), completed.Snapshot())
+	}
+}
+
+func TestEngineRecoverRejectsUnknownRun(t *testing.T) {
+	t.Parallel()
+
+	engine := mustEngineWithStore(t, 1, NewHandlerRegistry(), newMemoryTestStore())
+	var notFound *RunNotFoundError
+	if _, err := engine.Recover(context.Background(), "missing-run"); !errors.As(err, &notFound) {
+		t.Fatalf("Recover() error = %v, want *RunNotFoundError", err)
+	}
+}
+
 type asyncExecutionResult struct {
 	run *WorkflowRun
 	err error
@@ -385,11 +507,91 @@ func executeAsync(
 func mustEngine(t *testing.T, workerCount int, registry *HandlerRegistry) *Engine {
 	t.Helper()
 
-	engine, err := NewEngine(workerCount, registry)
+	return mustEngineWithStore(t, workerCount, registry, newMemoryTestStore())
+}
+
+func mustEngineWithStore(t *testing.T, workerCount int, registry *HandlerRegistry, store Store) *Engine {
+	t.Helper()
+
+	engine, err := NewEngine(workerCount, registry, store)
 	if err != nil {
 		t.Fatalf("NewEngine() error = %v", err)
 	}
 	return engine
+}
+
+type memoryTestStore struct {
+	mu          sync.RWMutex
+	definitions map[workflow.WorkflowID]workflow.WorkflowDefinition
+	runs        map[RunID]WorkflowRunSnapshot
+}
+
+func newMemoryTestStore() *memoryTestStore {
+	return &memoryTestStore{
+		definitions: make(map[workflow.WorkflowID]workflow.WorkflowDefinition),
+		runs:        make(map[RunID]WorkflowRunSnapshot),
+	}
+}
+
+func (store *memoryTestStore) SaveWorkflow(_ context.Context, definition workflow.WorkflowDefinition) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	if existing, exists := store.definitions[definition.ID]; exists && !reflect.DeepEqual(existing, definition) {
+		return &WorkflowConflictError{WorkflowID: definition.ID}
+	}
+	store.definitions[definition.ID] = cloneDefinition(definition)
+	return nil
+}
+
+func (store *memoryTestStore) LoadWorkflow(
+	_ context.Context,
+	workflowID workflow.WorkflowID,
+) (workflow.WorkflowDefinition, bool, error) {
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+
+	definition, found := store.definitions[workflowID]
+	return cloneDefinition(definition), found, nil
+}
+
+func (store *memoryTestStore) CreateRun(_ context.Context, snapshot WorkflowRunSnapshot) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	if _, exists := store.runs[snapshot.ID]; exists {
+		return &RunAlreadyExistsError{RunID: snapshot.ID}
+	}
+	store.runs[snapshot.ID] = cloneTestSnapshot(snapshot)
+	return nil
+}
+
+func (store *memoryTestStore) SaveRun(_ context.Context, snapshot WorkflowRunSnapshot) error {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	if _, exists := store.runs[snapshot.ID]; !exists {
+		return &RunNotFoundError{RunID: snapshot.ID}
+	}
+	store.runs[snapshot.ID] = cloneTestSnapshot(snapshot)
+	return nil
+}
+
+func (store *memoryTestStore) LoadRun(
+	_ context.Context,
+	runID RunID,
+) (WorkflowRunSnapshot, bool, error) {
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+
+	snapshot, found := store.runs[runID]
+	return cloneTestSnapshot(snapshot), found, nil
+}
+
+func cloneTestSnapshot(snapshot WorkflowRunSnapshot) WorkflowRunSnapshot {
+	clone := snapshot
+	clone.Tasks = append([]TaskRun(nil), snapshot.Tasks...)
+	return clone
 }
 
 func executionWorkflow(tasks ...workflow.TaskDefinition) workflow.WorkflowDefinition {

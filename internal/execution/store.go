@@ -51,6 +51,7 @@ func (snapshot WorkflowRunSnapshot) Validate() error {
 	}
 
 	seen := make(map[workflow.TaskID]struct{}, len(snapshot.Tasks))
+	statusCounts := make(map[TaskRunStatus]int)
 	for _, task := range snapshot.Tasks {
 		if !validIdentifier(string(task.TaskID)) {
 			return &SnapshotValidationError{RunID: snapshot.ID, Reason: "task run has an empty or invalid task ID"}
@@ -79,8 +80,39 @@ func (snapshot WorkflowRunSnapshot) Validate() error {
 		if task.Status == TaskRunCanceled && task.FinishedAt.IsZero() {
 			return &SnapshotValidationError{RunID: snapshot.ID, Reason: fmt.Sprintf("canceled task %q has no finish timestamp", task.TaskID)}
 		}
+		statusCounts[task.Status]++
+	}
+	if err := validateAggregateStatus(snapshot, statusCounts); err != nil {
+		return err
 	}
 
+	return nil
+}
+
+func validateAggregateStatus(snapshot WorkflowRunSnapshot, counts map[TaskRunStatus]int) error {
+	unfinished := counts[TaskRunPending] + counts[TaskRunReady] + counts[TaskRunRunning]
+	switch snapshot.Status {
+	case WorkflowRunPending:
+		if counts[TaskRunPending] != len(snapshot.Tasks) {
+			return &SnapshotValidationError{RunID: snapshot.ID, Reason: "pending workflow contains a task that has started"}
+		}
+	case WorkflowRunRunning:
+		// A task result and the workflow's terminal transition are separate
+		// durable mutations. Recovery finishes a partially recorded failure or
+		// cancellation before dispatching any more work.
+	case WorkflowRunSucceeded:
+		if counts[TaskRunSucceeded] != len(snapshot.Tasks) {
+			return &SnapshotValidationError{RunID: snapshot.ID, Reason: "succeeded workflow contains a task that did not succeed"}
+		}
+	case WorkflowRunFailed:
+		if unfinished > 0 || counts[TaskRunFailed]+counts[TaskRunCanceled] == 0 {
+			return &SnapshotValidationError{RunID: snapshot.ID, Reason: "failed workflow has inconsistent task states"}
+		}
+	case WorkflowRunCanceled:
+		if unfinished > 0 || counts[TaskRunFailed] > 0 {
+			return &SnapshotValidationError{RunID: snapshot.ID, Reason: "canceled workflow has inconsistent task states"}
+		}
+	}
 	return nil
 }
 

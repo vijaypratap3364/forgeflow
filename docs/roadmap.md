@@ -27,34 +27,41 @@ Keep this stage in memory and independent of workers, databases, brokers, and HT
 - Propagate cancellation and record task outcomes through explicit state transitions.
 - Exercise complete workflows in deterministic process-level tests.
 
-## Stage 3 — Reliable attempts and recovery semantics (next)
+## Stage 3 — Durable local persistence and restart recovery (complete)
+
+- Define a persistence boundary owned by the execution engine.
+- Persist workflow definitions and aggregate run/task state, timestamps, and attempt counts.
+- Provide a lightweight embedded journal with atomic append-and-sync mutations.
+- Reconstruct runs after restart without repeating completed tasks.
+- Keep storage paths configurable and repository tests isolated.
+
+## Stage 4 — Reliable attempts and distributed recovery semantics (next)
 
 - Model attempts, retry policy, backoff, leases, and idempotency keys.
 - Prevent duplicate claims and duplicate committed completion.
 - Track worker heartbeats and reclaim expired work.
 - Prove recovery behavior first with an in-memory implementation and controlled time.
 
-## Stage 4 — Durable storage and API
+## Stage 5 — API and production storage
 
-- Introduce a narrow persistence interface backed first by a lightweight implementation.
 - Add an HTTP API for workflow submission, inspection, and cancellation.
 - Define validation, error, pagination, and concurrency behavior before optimizing transport.
-- Add PostgreSQL only when durable transactional requirements justify it.
+- Add PostgreSQL behind the existing Store boundary when multi-process transactional requirements justify it.
 
-## Stage 5 — Distributed messaging and workers
+## Stage 6 — Distributed messaging and workers
 
 - Introduce a broker interface and a production-grade broker adapter.
 - Run workers as separate processes and make delivery/redelivery behavior explicit.
 - Add integration and failure-injection tests in CI or remote infrastructure.
 - Do not require Kafka or another heavy broker on the constrained development machine.
 
-## Stage 6 — Operations and scale evidence
+## Stage 7 — Operations and scale evidence
 
 - Add structured logs, metrics, traces, health checks, and operational runbooks.
 - Build repeatable load and soak tests with stored configurations and raw results.
 - Measure bottlenecks and tune from evidence; never invent performance figures.
 
-## Stage 7 — Security and cloud deployment
+## Stage 8 — Security and cloud deployment
 
 - Add authentication, authorization, secret management, and tenant boundaries appropriate to the chosen API model.
 - Package and deploy the system in remote/cloud environments.
