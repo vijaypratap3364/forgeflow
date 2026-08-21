@@ -70,15 +70,23 @@ The current API addresses individual resources by stable ID; collection listing 
 
 The transport is process-neutral, but the current executable still hosts worker goroutines with each run's scheduler. Extracting that runtime into a separately deployable worker and adding automatic cross-process run discovery are explicit follow-up work; the project does not claim those pieces are already present.
 
-## Stage 8 — Operations and scale evidence
+## Stage 8 — Authentication, projects, and authorization (complete)
+
+- Verify externally issued, expiring Ed25519 JWTs without building an identity provider.
+- Persist users, projects, workflow ownership, and member/operator/admin memberships.
+- Derive authorization from resource ownership and persisted roles at every API boundary.
+- Add administrative audit events and authenticated-subject rate limiting.
+- Document the threat model and the protections explicitly left to an issuer or deployment edge.
+
+## Stage 9 — Operations and scale evidence
 
 - Add structured logs, metrics, traces, health checks, and operational runbooks.
 - Build repeatable load and soak tests with stored configurations and raw results.
 - Measure bottlenecks and tune from evidence; never invent performance figures.
 
-## Stage 9 — Security and cloud deployment
+## Stage 10 — Cloud deployment and security hardening
 
-- Add authentication, authorization, secret management, and tenant boundaries appropriate to the chosen API model.
+- Add identity-provider/JWKS integration, key rotation, shared rate limiting, secret management, and stronger tenant controls.
 - Package and deploy the system in remote/cloud environments.
 - Add staged rollout, backup, restore, and disaster-recovery procedures.
 - Keep local development lightweight even as production deployment grows.

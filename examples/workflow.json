@@ -1,5 +1,6 @@
 {
   "id": "forge-demo",
+  "project_id": "forge-demo-project",
   "tasks": [
     {
       "id": "prepare",

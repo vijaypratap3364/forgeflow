@@ -8,11 +8,11 @@ Reliable workflow execution is more than running functions in order. A useful en
 
 ## Current status
 
-**Stage 7: durable distributed task transport.** ForgeFlow now provides validated workflow definitions, explicit workflow/task run state machines, a scheduler, a safe task-handler registry, configurable concurrent workers, retry policy with exponential backoff, identified task attempts, worker heartbeats, expiring task leases, a versioned REST API with live Server-Sent Events (SSE), interchangeable embedded-file and PostgreSQL stores, and interchangeable in-memory and NATS JetStream task brokers.
+**Stage 8: authenticated multi-project API.** ForgeFlow now provides validated workflow definitions, explicit workflow/task run state machines, a scheduler, a safe task-handler registry, configurable concurrent workers, retry policy with exponential backoff, identified task attempts, worker heartbeats, expiring task leases, a versioned REST API with live Server-Sent Events (SSE), interchangeable embedded-file and PostgreSQL stores, interchangeable in-memory and NATS JetStream task brokers, Ed25519 JWT authentication, project-scoped RBAC, workflow ownership, administrative audit events, and API rate limiting.
 
 Independent tasks run concurrently, successful dependencies unlock downstream work, and terminal task failure or context cancellation stops unfinished work consistently. Marked transient failures retry within policy using testable exponential backoff. Every dispatch has a stable task-run ID and attempt ID; only the worker holding that attempt's valid persisted lease can commit its result. Heartbeats renew active leases and extend the broker acknowledgement deadline, while expired leases make abandoned work retryable without rerunning already completed tasks. The standard-library HTTP server accepts definitions, starts and cancels asynchronous runs, exposes durable run/task status, and streams persisted transitions. PostgreSQL makes aggregate changes transactional and rejects stale concurrent writers; JetStream provides file-backed work-queue retention, durable pull consumers, acknowledgements, and redelivery.
 
-The current executable still hosts each run's worker goroutines with its scheduler. The broker boundary and JetStream adapter make task delivery network-capable and process-neutral, but a separately deployable worker command and automatic cross-process recovery controller remain future work. Authentication and deployment infrastructure are also not implemented. See [the roadmap](docs/roadmap.md) for the planned progression and [the architecture notes](docs/architecture.md) for the exact reliability and delivery guarantees.
+The current executable still hosts each run's worker goroutines with its scheduler. The broker boundary and JetStream adapter make task delivery network-capable and process-neutral, but a separately deployable worker command and automatic cross-process recovery controller remain future work. Token issuance/login, distributed rate limiting, and deployment infrastructure are not implemented. See [the roadmap](docs/roadmap.md), [architecture notes](docs/architecture.md), and [security model](docs/security.md) for the exact boundaries and guarantees.
 
 ## Local development
 
@@ -52,6 +52,7 @@ ForgeFlow does **not** claim universal exactly-once task execution. A completion
 Prerequisite: Go 1.26 or newer within the Go 1 compatibility line.
 
 ```text
+# First provide the public verification key for your external JWT issuer.
 go run ./cmd/forgeflow
 go fmt ./...
 go vet ./...
@@ -75,29 +76,36 @@ The server listens on `127.0.0.1:8080` and writes its embedded journal to `data/
 | `FORGEFLOW_NATS_SUBJECT_PREFIX` | `forgeflow.tasks` | Subject namespace for task topics |
 | `FORGEFLOW_WORKERS` | `4` | Worker goroutines per active run |
 | `FORGEFLOW_SHUTDOWN_TIMEOUT` | `10s` | Graceful-shutdown deadline |
+| `FORGEFLOW_JWT_PUBLIC_KEY` | required | PEM-encoded Ed25519 public verification key |
+| `FORGEFLOW_JWT_ISSUER` | `forgeflow` | Required JWT `iss` value |
+| `FORGEFLOW_JWT_AUDIENCE` | `forgeflow-api` | Required JWT `aud` value |
+| `FORGEFLOW_JWT_LEEWAY` | `30s` | Allowed clock skew for time claims |
+| `FORGEFLOW_RATE_LIMIT` | `120` | Authenticated API requests allowed per subject/window |
+| `FORGEFLOW_RATE_LIMIT_WINDOW` | `1m` | In-process fixed rate-limit window |
 
 The checked-in [.env.example](.env.example) is a reference; ForgeFlow does not load dotenv files itself.
 
 ## API quickstart
 
-With `go run ./cmd/forgeflow` running, submit a safe demo workflow:
+ForgeFlow validates externally issued Ed25519 JWTs; it deliberately does not contain a login or token-minting endpoint. Configure the verifier, obtain a token whose `iss` and `aud` match, and export it as `TOKEN`. The token subject can create a project and becomes its first admin:
 
 ```text
-curl -i -H "Content-Type: application/json" --data-binary @examples/workflow.json http://127.0.0.1:8080/api/v1/workflows
+curl -i -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"id":"forge-demo-project","name":"Forge Demo"}' http://127.0.0.1:8080/api/v1/projects
+curl -i -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" --data-binary @examples/workflow.json http://127.0.0.1:8080/api/v1/workflows
 ```
 
 Create an asynchronous execution with a caller-selected stable ID:
 
 ```text
-curl -i -H "Content-Type: application/json" -d '{"run_id":"demo-run"}' http://127.0.0.1:8080/api/v1/workflows/forge-demo/runs
+curl -i -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"run_id":"demo-run"}' http://127.0.0.1:8080/api/v1/workflows/forge-demo/runs
 ```
 
 Stream its persisted transitions, then inspect the final aggregate and task output:
 
 ```text
-curl -N http://127.0.0.1:8080/api/v1/runs/demo-run/events
-curl http://127.0.0.1:8080/api/v1/runs/demo-run
-curl http://127.0.0.1:8080/api/v1/runs/demo-run/tasks
+curl -N -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/runs/demo-run/events
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/runs/demo-run
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:8080/api/v1/runs/demo-run/tasks
 ```
 
 The event stream replays transitions retained by the current process and closes when the workflow succeeds, fails, or is canceled. See [the complete curl walkthrough](examples/README.md) for cancellation and Windows PowerShell notes.
@@ -106,12 +114,18 @@ The event stream replays transitions retained by the current process and closes 
 
 | Method | Path | Purpose |
 | --- | --- | --- |
+| `POST` | `/api/v1/projects` | Create a project; caller becomes its admin |
+| `GET`, `PATCH` | `/api/v1/projects/{projectID}` | Read or administratively rename a project |
+| `GET` | `/api/v1/projects/{projectID}/members` | List project memberships (admin) |
+| `PUT` | `/api/v1/projects/{projectID}/members/{userID}` | Assign a project role (admin) |
+| `GET` | `/api/v1/projects/{projectID}/audit-events` | Read administrative audit events (admin) |
 | `POST` | `/api/v1/workflows` | Validate and persist a workflow definition |
 | `GET` | `/api/v1/workflows/{id}` | Read a workflow definition |
 | `POST` | `/api/v1/workflows/{id}/runs` | Persist and asynchronously start a run |
 | `GET` | `/api/v1/runs/{runID}` | Read aggregate run status and task counts |
 | `GET` | `/api/v1/runs/{runID}/tasks` | Read task-level status, attempts, outputs, and errors |
 | `POST` | `/api/v1/runs/{runID}/cancel` | Request cancellation of a nonterminal run |
+| `POST` | `/api/v1/runs/{runID}/retry` | Start a fresh run from a failed/canceled run (operator) |
 | `GET` | `/api/v1/runs/{runID}/events` | Stream persisted state transitions with SSE |
 | `GET` | `/healthz` | Process liveness |
 | `GET` | `/readyz` | Request-serving readiness |
@@ -125,6 +139,7 @@ internal/api/       versioned HTTP API, async run lifecycle, and SSE events
 internal/broker/    task transport contract plus in-memory and JetStream adapters
 internal/execution/ run state, scheduler, handlers, and workers
 internal/persistence/ embedded and PostgreSQL Store implementations and migrations
+internal/security/  JWT verification, tenancy, roles, and rate limiting
 internal/workflow/  workflow definitions and DAG semantics
 docs/               architecture and delivery roadmap
 ```
