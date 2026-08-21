@@ -61,6 +61,53 @@ func TestEngineAcknowledgesTaskOnlyAfterCompletionIsDurable(t *testing.T) {
 	}
 }
 
+func TestEngineExecutesTaskOnlyAfterLeaseIsDurable(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := guardedContext(t)
+	defer cancel()
+	store := &leaseBlockingStore{
+		Store:   newMemoryTestStore(),
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	handlerStarted := make(chan struct{})
+	registry := NewHandlerRegistry()
+	if err := registry.Register("lease-probe", TaskHandlerFunc(func(context.Context, TaskRequest) (string, error) {
+		close(handlerStarted)
+		return "", nil
+	})); err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	engine, err := NewEngine(1, registry, store)
+	if err != nil {
+		t.Fatalf("NewEngine() error = %v", err)
+	}
+
+	result := executeAsync(
+		engine,
+		ctx,
+		"broker-lease-order-run",
+		executionWorkflow(executionTask("task", "lease-probe", "")),
+	)
+	receive(t, ctx, store.entered, "lease persistence boundary")
+	select {
+	case <-handlerStarted:
+		t.Fatal("handler started before its task lease persisted")
+	default:
+	}
+	close(store.release)
+	receive(t, ctx, handlerStarted, "handler start after lease persistence")
+
+	executionResult := receive(t, ctx, result, "lease-ordered execution")
+	if executionResult.err != nil {
+		t.Fatalf("Engine.Execute() error = %v", executionResult.err)
+	}
+	if executionResult.run.Status() != WorkflowRunSucceeded {
+		t.Fatalf("run status = %q, want succeeded", executionResult.run.Status())
+	}
+}
+
 func TestEngineLeavesReadyTaskRecoverableWhenPublishFails(t *testing.T) {
 	t.Parallel()
 
@@ -102,6 +149,32 @@ type completionBlockingStore struct {
 	once    sync.Once
 	entered chan struct{}
 	release chan struct{}
+}
+
+type leaseBlockingStore struct {
+	Store
+	once    sync.Once
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (store *leaseBlockingStore) SaveRun(
+	ctx context.Context,
+	snapshot WorkflowRunSnapshot,
+) (WorkflowRunSnapshot, error) {
+	for _, task := range snapshot.Tasks {
+		if task.Status != TaskRunRunning || task.Lease == nil {
+			continue
+		}
+		store.once.Do(func() { close(store.entered) })
+		select {
+		case <-store.release:
+		case <-ctx.Done():
+			return WorkflowRunSnapshot{}, ctx.Err()
+		}
+		break
+	}
+	return store.Store.SaveRun(ctx, snapshot)
 }
 
 func (store *completionBlockingStore) SaveRun(

@@ -59,3 +59,44 @@ jobs:
           cache-dependency-path: go.sum
       - name: Run PostgreSQL integration tests
         run: go test -race -tags=integration ./internal/persistence -count=1
+
+  nats:
+    name: NATS JetStream integration
+    runs-on: ubuntu-latest
+    env:
+      FORGEFLOW_NATS_TEST_URL: nats://127.0.0.1:4222
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Install pinned NATS server
+        run: go install github.com/nats-io/nats-server/v2@v2.12.15
+      - name: Start NATS with JetStream
+        run: |
+          mkdir -p "${RUNNER_TEMP}/forgeflow-nats"
+          "$(go env GOPATH)/bin/nats-server" \
+            -js \
+            -sd "${RUNNER_TEMP}/forgeflow-nats" \
+            -m 8222 \
+            >"${RUNNER_TEMP}/forgeflow-nats.log" 2>&1 &
+          echo "NATS_SERVER_PID=$!" >> "${GITHUB_ENV}"
+          for attempt in {1..30}; do
+            if curl --fail --silent http://127.0.0.1:8222/healthz >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "${RUNNER_TEMP}/forgeflow-nats.log"
+          exit 1
+      - name: Run NATS integration tests
+        run: go test -race -tags=integration ./internal/broker ./internal/execution -count=1
+      - name: Stop NATS and show server log
+        if: always()
+        run: |
+          if [[ -n "${NATS_SERVER_PID:-}" ]]; then
+            kill "${NATS_SERVER_PID}" || true
+          fi
+          cat "${RUNNER_TEMP}/forgeflow-nats.log" || true
