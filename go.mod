@@ -1,6 +1,6 @@
 module github.com/vijaypratap3364/forgeflow
 
-go 1.26.0
+go 1.26.6
 
 require (
 	github.com/golang-jwt/jwt/v5 v5.3.1

@@ -70,7 +70,7 @@ go test -race -tags=integration ./internal/broker ./internal/execution
 
 ForgeFlow does **not** claim universal exactly-once task execution. A completion carrying the same attempt ID is applied to workflow state at most once, and a persisted valid lease prevents another assignment from being committed. If a worker disappears after performing a side effect but before recording completion, JetStream can redeliver the message and lease expiry can dispatch a new attempt. Handler execution is therefore at-least-once across broker redelivery, crash recovery, and configured retries. Handlers that affect external systems should use the stable task-run or attempt ID as an application-level idempotency key. See [the architecture notes](docs/architecture.md#delivery-and-execution-semantics) for the precise boundaries.
 
-Prerequisite: Go 1.26 or newer within the Go 1 compatibility line.
+Prerequisite: Go 1.26.6 or newer within the Go 1 compatibility line. Earlier Go 1.26 patch releases contain reachable standard-library vulnerabilities rejected by the CI security gate.
 
 ```text
 # First provide the public verification key for your external JWT issuer.
