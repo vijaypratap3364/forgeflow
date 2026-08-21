@@ -3,6 +3,7 @@ package execution
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -257,11 +258,9 @@ func TestEngineCancellationStopsWorkersAndKeepsStateConsistent(t *testing.T) {
 func TestEngineSupportsSimultaneousWorkflowRuns(t *testing.T) {
 	t.Parallel()
 
-	started := make(chan RunID, 2)
-	releases := map[RunID]chan struct{}{
-		"run-one": make(chan struct{}),
-		"run-two": make(chan struct{}),
-	}
+	const runCount = 8
+	started := make(chan RunID, runCount)
+	releases := make(map[RunID]chan struct{}, runCount)
 	registry := NewHandlerRegistry()
 	if err := registry.Register("multi-run", TaskHandlerFunc(func(ctx context.Context, request TaskRequest) (string, error) {
 		started <- request.RunID
@@ -280,26 +279,34 @@ func TestEngineSupportsSimultaneousWorkflowRuns(t *testing.T) {
 	ctx, cancel := guardedContext(t)
 	defer cancel()
 
-	resultOne := executeAsync(engine, ctx, "run-one", definition)
-	resultTwo := executeAsync(engine, ctx, "run-two", definition)
-	first := receive(t, ctx, started, "first workflow start")
-	second := receive(t, ctx, started, "second workflow start")
-	if first == second {
-		t.Fatalf("workflow run %q started twice", first)
+	results := make(map[RunID]<-chan asyncExecutionResult, runCount)
+	for index := 0; index < runCount; index++ {
+		runID := RunID(fmt.Sprintf("concurrent-run-%d", index))
+		releases[runID] = make(chan struct{})
 	}
-	close(releases["run-one"])
-	close(releases["run-two"])
+	for runID := range releases {
+		results[runID] = executeAsync(engine, ctx, runID, definition)
+	}
 
-	for name, result := range map[string]<-chan asyncExecutionResult{
-		"run-one": resultOne,
-		"run-two": resultTwo,
-	} {
-		executionResult := receive(t, ctx, result, name+" result")
+	observed := make(map[RunID]struct{}, runCount)
+	for index := 0; index < runCount; index++ {
+		runID := receive(t, ctx, started, "concurrent workflow start")
+		if _, duplicate := observed[runID]; duplicate {
+			t.Fatalf("workflow run %q started twice", runID)
+		}
+		observed[runID] = struct{}{}
+	}
+	for _, release := range releases {
+		close(release)
+	}
+
+	for runID, result := range results {
+		executionResult := receive(t, ctx, result, string(runID)+" result")
 		if executionResult.err != nil {
-			t.Fatalf("%s Execute() error = %v", name, executionResult.err)
+			t.Fatalf("%s Execute() error = %v", runID, executionResult.err)
 		}
 		if executionResult.run.Status() != WorkflowRunSucceeded {
-			t.Fatalf("%s status = %q, want %q", name, executionResult.run.Status(), WorkflowRunSucceeded)
+			t.Fatalf("%s status = %q, want %q", runID, executionResult.run.Status(), WorkflowRunSucceeded)
 		}
 	}
 }
